@@ -16,7 +16,6 @@ char LICENSE[] SEC("license") = "GPL";
 #define NO_UNROLL _Pragma("clang loop unroll(disable)")
 
 #define MAX_DOMAIN_LEN 96
-#define MAX_HTTP_SCAN 96
 #define MAX_TLS_SCAN 512
 #define MAX_DNS_SCAN 128
 #define MAX_DNS_LABELS 16
@@ -296,73 +295,95 @@ static __noinline int ip6_port_matches(__u8 addr[16], __u16 port, __u8 proto)
     return rule != 0;
 }
 
-static __noinline int check_http_host(void *data, void *data_end, __u32 payload_off)
+static __noinline int check_http_host_at(void *data, void *data_end,
+                                         __u32 payload_off, __u32 rel_off)
 {
     if (payload_off >= MAX_PACKET_READ)
         return XDP_PASS;
+    if (rel_off > 64 || payload_off > MAX_PACKET_READ - rel_off)
+        return XDP_PASS;
 
-    __u32 scan_len = MAX_HTTP_SCAN;
-    if (scan_len > MAX_PACKET_READ - payload_off)
-        scan_len = MAX_PACKET_READ - payload_off;
+    __u32 off = payload_off + rel_off;
+    __u8 h = 0, o = 0, s = 0, t = 0, colon = 0;
+
+    if (!load_u8(data, data_end, off, &h))
+        return XDP_PASS;
+    if (!load_u8(data, data_end, off + 1, &o))
+        return XDP_PASS;
+    if (!load_u8(data, data_end, off + 2, &s))
+        return XDP_PASS;
+    if (!load_u8(data, data_end, off + 3, &t))
+        return XDP_PASS;
+    if (!load_u8(data, data_end, off + 4, &colon))
+        return XDP_PASS;
+
+    if (ascii_lower(h) != 'h' || ascii_lower(o) != 'o' ||
+        ascii_lower(s) != 's' || ascii_lower(t) != 't' || colon != ':')
+        return XDP_PASS;
+
+    __u32 host_off = off + 5;
+    if (host_off >= MAX_PACKET_READ)
+        return XDP_PASS;
+
+    __u8 c = 0;
+    if (!load_u8(data, data_end, host_off, &c))
+        return XDP_PASS;
+    if (c == ' ' || c == '\t')
+        host_off++;
+    if (host_off >= MAX_PACKET_READ)
+        return XDP_PASS;
+
+    if (!load_u8(data, data_end, host_off, &c))
+        return XDP_PASS;
+    if (c == ' ' || c == '\t')
+        host_off++;
+    if (host_off >= MAX_PACKET_READ)
+        return XDP_PASS;
+
+    __u32 host_len = 0;
 
     NO_UNROLL
-    for (int i = 0; i < MAX_HTTP_SCAN; i++) {
-        if ((__u32)i >= scan_len)
+    for (int j = 0; j < MAX_DOMAIN_LEN - 1; j++) {
+        __u8 hc = 0;
+        if (!load_u8(data, data_end, host_off + j, &hc))
             break;
-
-        __u32 off = payload_off + i;
-        __u8 h = 0, o = 0, s = 0, t = 0, colon = 0;
-
-        if (!load_u8(data, data_end, off, &h))
+        if (hc == '\r' || hc == '\n' || hc == ' ' || hc == '\t' || hc == ':')
             break;
-        if (!load_u8(data, data_end, off + 1, &o))
-            break;
-        if (!load_u8(data, data_end, off + 2, &s))
-            break;
-        if (!load_u8(data, data_end, off + 3, &t))
-            break;
-        if (!load_u8(data, data_end, off + 4, &colon))
-            break;
-
-        if (ascii_lower(h) != 'h' || ascii_lower(o) != 'o' ||
-            ascii_lower(s) != 's' || ascii_lower(t) != 't' || colon != ':')
-            continue;
-
-        __u32 host_off = off + 5;
-        if (host_off >= MAX_PACKET_READ)
-            return XDP_PASS;
-
-        NO_UNROLL
-        for (int skip = 0; skip < 4; skip++) {
-            __u8 c = 0;
-            if (!load_u8(data, data_end, host_off, &c))
-                return XDP_PASS;
-            if (c != ' ' && c != '\t')
-                break;
-            host_off++;
-            if (host_off >= MAX_PACKET_READ)
-                return XDP_PASS;
-        }
-
-        __u32 host_len = 0;
-
-        NO_UNROLL
-        for (int j = 0; j < MAX_DOMAIN_LEN - 1; j++) {
-            __u8 c = 0;
-            if (!load_u8(data, data_end, host_off + j, &c))
-                break;
-            if (c == '\r' || c == '\n' || c == ' ' || c == '\t' || c == ':')
-                break;
-            host_len++;
-        }
-
-        if (domain_from_packet_matches(data, data_end, host_off, host_len, DOMAIN_HTTP))
-            return XDP_DROP;
-
-        return XDP_PASS;
+        host_len++;
     }
 
+    if (domain_from_packet_matches(data, data_end, host_off, host_len, DOMAIN_HTTP))
+        return XDP_DROP;
+
     return XDP_PASS;
+}
+
+static __noinline int check_http_host(void *data, void *data_end, __u32 payload_off)
+{
+    int action = XDP_PASS;
+
+    action = check_http_host_at(data, data_end, payload_off, 16);
+    if (action == XDP_DROP)
+        return action;
+    action = check_http_host_at(data, data_end, payload_off, 17);
+    if (action == XDP_DROP)
+        return action;
+    action = check_http_host_at(data, data_end, payload_off, 18);
+    if (action == XDP_DROP)
+        return action;
+    action = check_http_host_at(data, data_end, payload_off, 19);
+    if (action == XDP_DROP)
+        return action;
+    action = check_http_host_at(data, data_end, payload_off, 20);
+    if (action == XDP_DROP)
+        return action;
+    action = check_http_host_at(data, data_end, payload_off, 24);
+    if (action == XDP_DROP)
+        return action;
+    action = check_http_host_at(data, data_end, payload_off, 32);
+    if (action == XDP_DROP)
+        return action;
+    return check_http_host_at(data, data_end, payload_off, 48);
 }
 
 static __noinline int check_tls_sni(void *data, void *data_end, __u32 payload_off)
