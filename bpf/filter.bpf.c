@@ -32,6 +32,10 @@ char LICENSE[] SEC("license") = "GPL";
 #define DISPATCH_UDP4 3
 #define DISPATCH_TCP6 4
 #define DISPATCH_UDP6 5
+#define DISPATCH_HTTP4 6
+#define DISPATCH_TLS4 7
+#define DISPATCH_HTTP6 8
+#define DISPATCH_TLS6 9
 
 #define STAT_TOTAL 0
 #define STAT_PASSED 1
@@ -126,7 +130,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 6);
+    __uint(max_entries, 10);
     __type(key, __u32);
     __type(value, __u32);
 } dispatch_rules SEC(".maps");
@@ -679,9 +683,16 @@ static __always_inline int check_dns_v6(void *data, void *data_end, struct ethhd
     return poison_dns_nxdomain_v6(eth, ip6, udp, dns);
 }
 
-static __noinline int handle_tcp_common(void *data, void *data_end,
-                                        struct tcphdr *tcp, __u32 l4_off)
+static __always_inline int parse_tcp_ports(void *data, void *data_end, __u32 l4_off,
+                                           __u32 *payload_off, __u16 *sport,
+                                           __u16 *dport)
 {
+    struct tcphdr *tcp = (void *)((char *)data + l4_off);
+    if ((void *)(tcp + 1) > data_end) {
+        inc_stat(STAT_MALFORMED);
+        return XDP_PASS;
+    }
+
     __u8 tcp_doff = tcp->doff;
     if (tcp_doff < 5 || tcp_doff > 15) {
         inc_stat(STAT_MALFORMED);
@@ -694,65 +705,34 @@ static __noinline int handle_tcp_common(void *data, void *data_end,
         return XDP_PASS;
     }
 
-    __u16 dport = bpf_ntohs(tcp->dest);
-    __u32 payload_off = l4_off + tcp_header_len;
-    int action = XDP_PASS;
-
-    if (dport == 80) {
-        action = check_http_host(data, data_end, payload_off);
-        if (action == XDP_DROP)
-            inc_stat(STAT_HTTP_BLOCKED);
-    } else if (dport == 443) {
-        action = check_tls_sni(data, data_end, payload_off);
-        if (action == XDP_DROP)
-            inc_stat(STAT_TLS_BLOCKED);
-    }
-
-    if (action == XDP_PASS)
-        inc_stat(STAT_PASSED);
-    return action;
+    *sport = bpf_ntohs(tcp->source);
+    *dport = bpf_ntohs(tcp->dest);
+    *payload_off = l4_off + tcp_header_len;
+    return -1;
 }
 
-static __noinline int handle_tcp_v4(void *data, void *data_end, struct iphdr *ip,
-                                    __u32 l4_off)
+static __always_inline int run_http_rule(void *data, void *data_end, __u32 payload_off)
 {
-    struct tcphdr *tcp = (void *)((char *)data + l4_off);
-    if ((void *)(tcp + 1) > data_end) {
-        inc_stat(STAT_MALFORMED);
-        return XDP_PASS;
-    }
-
-    __u16 sport = bpf_ntohs(tcp->source);
-    __u16 dport = bpf_ntohs(tcp->dest);
-
-    if (ip_port_matches(ip->daddr, dport, IPPROTO_TCP) ||
-        ip_port_matches(ip->saddr, sport, IPPROTO_TCP)) {
-        inc_stat(STAT_IP_PORT_BLOCKED);
+    int action = check_http_host(data, data_end, payload_off);
+    if (action == XDP_DROP) {
+        inc_stat(STAT_HTTP_BLOCKED);
         return XDP_DROP;
     }
 
-    return handle_tcp_common(data, data_end, tcp, l4_off);
+    inc_stat(STAT_PASSED);
+    return XDP_PASS;
 }
 
-static __noinline int handle_tcp_v6(void *data, void *data_end, struct ipv6hdr *ip6,
-                                    __u32 l4_off)
+static __always_inline int run_tls_rule(void *data, void *data_end, __u32 payload_off)
 {
-    struct tcphdr *tcp = (void *)((char *)data + l4_off);
-    if ((void *)(tcp + 1) > data_end) {
-        inc_stat(STAT_MALFORMED);
-        return XDP_PASS;
-    }
-
-    __u16 sport = bpf_ntohs(tcp->source);
-    __u16 dport = bpf_ntohs(tcp->dest);
-
-    if (ip6_port_matches(ip6->daddr, dport, IPPROTO_TCP) ||
-        ip6_port_matches(ip6->saddr, sport, IPPROTO_TCP)) {
-        inc_stat(STAT_IP_PORT_BLOCKED);
+    int action = check_tls_sni(data, data_end, payload_off);
+    if (action == XDP_DROP) {
+        inc_stat(STAT_TLS_BLOCKED);
         return XDP_DROP;
     }
 
-    return handle_tcp_common(data, data_end, tcp, l4_off);
+    inc_stat(STAT_PASSED);
+    return XDP_PASS;
 }
 
 static __noinline int handle_udp_v4(void *data, void *data_end, struct ethhdr *eth,
@@ -909,7 +889,32 @@ int xdp_tcp4(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    return handle_tcp_v4(data, data_end, ip, l4_off);
+    __u32 payload_off = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_tcp_ports(data, data_end, l4_off, &payload_off, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+
+    if (ip_port_matches(ip->daddr, dport, IPPROTO_TCP) ||
+        ip_port_matches(ip->saddr, sport, IPPROTO_TCP)) {
+        inc_stat(STAT_IP_PORT_BLOCKED);
+        return XDP_DROP;
+    }
+
+    if (dport == 80) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_HTTP4);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    if (dport == 443) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_TLS4);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    inc_stat(STAT_PASSED);
+    return XDP_PASS;
 }
 
 SEC("xdp/udp4")
@@ -955,7 +960,148 @@ int xdp_tcp6(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    return handle_tcp_v6(data, data_end, ip6, l4_off);
+    __u32 payload_off = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_tcp_ports(data, data_end, l4_off, &payload_off, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+
+    if (ip6_port_matches(ip6->daddr, dport, IPPROTO_TCP) ||
+        ip6_port_matches(ip6->saddr, sport, IPPROTO_TCP)) {
+        inc_stat(STAT_IP_PORT_BLOCKED);
+        return XDP_DROP;
+    }
+
+    if (dport == 80) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_HTTP6);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    if (dport == 443) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_TLS6);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    inc_stat(STAT_PASSED);
+    return XDP_PASS;
+}
+
+SEC("xdp/http4")
+int xdp_http4(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct iphdr *ip = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv4(data, data_end, &ip, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+    if (ip->protocol != IPPROTO_TCP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    __u32 payload_off = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_tcp_ports(data, data_end, l4_off, &payload_off, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+    if (dport != 80) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    return run_http_rule(data, data_end, payload_off);
+}
+
+SEC("xdp/tls4")
+int xdp_tls4(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct iphdr *ip = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv4(data, data_end, &ip, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+    if (ip->protocol != IPPROTO_TCP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    __u32 payload_off = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_tcp_ports(data, data_end, l4_off, &payload_off, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+    if (dport != 443) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    return run_tls_rule(data, data_end, payload_off);
+}
+
+SEC("xdp/http6")
+int xdp_http6(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ipv6hdr *ip6 = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv6(data, data_end, &ip6, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+    if (ip6->nexthdr != IPPROTO_TCP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    __u32 payload_off = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_tcp_ports(data, data_end, l4_off, &payload_off, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+    if (dport != 80) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    return run_http_rule(data, data_end, payload_off);
+}
+
+SEC("xdp/tls6")
+int xdp_tls6(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ipv6hdr *ip6 = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv6(data, data_end, &ip6, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+    if (ip6->nexthdr != IPPROTO_TCP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    __u32 payload_off = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_tcp_ports(data, data_end, l4_off, &payload_off, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+    if (dport != 443) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    return run_tls_rule(data, data_end, payload_off);
 }
 
 SEC("xdp/udp6")
