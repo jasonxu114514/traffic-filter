@@ -150,7 +150,7 @@ func sendPkt(fd int, data []byte, ifIdx int) {
 		Protocol: htons(unix.ETH_P_IP),
 		Ifindex:  ifIdx,
 	}
-	unix.Sendto(fd, data, 0, addr)
+	unix.Sendto(fd, data, 0, &addr)
 }
 
 // ─── checksums ───────────────────────────────────────────────────────────
