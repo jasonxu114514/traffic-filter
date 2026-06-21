@@ -28,6 +28,10 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define DISPATCH_IPV4 0
 #define DISPATCH_IPV6 1
+#define DISPATCH_TCP4 2
+#define DISPATCH_UDP4 3
+#define DISPATCH_TCP6 4
+#define DISPATCH_UDP6 5
 
 #define STAT_TOTAL 0
 #define STAT_PASSED 1
@@ -122,7 +126,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 2);
+    __uint(max_entries, 6);
     __type(key, __u32);
     __type(value, __u32);
 } dispatch_rules SEC(".maps");
@@ -809,8 +813,15 @@ static __noinline int handle_udp_v6(void *data, void *data_end, struct ethhdr *e
     return XDP_PASS;
 }
 
-static __noinline int handle_ipv4(void *data, void *data_end, struct ethhdr *eth)
+static __noinline int validate_ipv4(void *data, void *data_end, struct iphdr **out_ip,
+                                    __u32 *out_l4_off)
 {
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        inc_stat(STAT_MALFORMED);
+        return XDP_PASS;
+    }
+
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end) {
         inc_stat(STAT_MALFORMED);
@@ -846,19 +857,20 @@ static __noinline int handle_ipv4(void *data, void *data_end, struct ethhdr *eth
     }
 
     __u32 l4_off = sizeof(struct ethhdr) + ip_header_len;
-
-    if (ip->protocol == IPPROTO_TCP)
-        return handle_tcp_v4(data, data_end, ip, l4_off);
-
-    if (ip->protocol == IPPROTO_UDP)
-        return handle_udp_v4(data, data_end, eth, ip, l4_off);
-
-    inc_stat(STAT_PASSED);
-    return XDP_PASS;
+    *out_ip = ip;
+    *out_l4_off = l4_off;
+    return -1;
 }
 
-static __noinline int handle_ipv6(void *data, void *data_end, struct ethhdr *eth)
+static __noinline int validate_ipv6(void *data, void *data_end, struct ipv6hdr **out_ip6,
+                                    __u32 *out_l4_off)
 {
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        inc_stat(STAT_MALFORMED);
+        return XDP_PASS;
+    }
+
     struct ipv6hdr *ip6 = (void *)(eth + 1);
     if ((void *)(ip6 + 1) > data_end) {
         inc_stat(STAT_MALFORMED);
@@ -875,16 +887,101 @@ static __noinline int handle_ipv6(void *data, void *data_end, struct ethhdr *eth
         return XDP_DROP;
     }
 
-    __u32 l4_off = sizeof(struct ethhdr) + sizeof(struct ipv6hdr);
+    *out_ip6 = ip6;
+    *out_l4_off = sizeof(struct ethhdr) + sizeof(struct ipv6hdr);
+    return -1;
+}
 
-    if (ip6->nexthdr == IPPROTO_TCP)
-        return handle_tcp_v6(data, data_end, ip6, l4_off);
+SEC("xdp/tcp4")
+int xdp_tcp4(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
 
-    if (ip6->nexthdr == IPPROTO_UDP)
-        return handle_udp_v6(data, data_end, eth, ip6, l4_off);
+    struct iphdr *ip = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv4(data, data_end, &ip, &l4_off);
+    if (verdict >= 0)
+        return verdict;
 
-    inc_stat(STAT_PASSED);
-    return XDP_PASS;
+    if (ip->protocol != IPPROTO_TCP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    return handle_tcp_v4(data, data_end, ip, l4_off);
+}
+
+SEC("xdp/udp4")
+int xdp_udp4(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        inc_stat(STAT_MALFORMED);
+        return XDP_PASS;
+    }
+
+    struct iphdr *ip = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv4(data, data_end, &ip, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+
+    if (ip->protocol != IPPROTO_UDP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    return handle_udp_v4(data, data_end, eth, ip, l4_off);
+}
+
+SEC("xdp/tcp6")
+int xdp_tcp6(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ipv6hdr *ip6 = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv6(data, data_end, &ip6, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+
+    if (ip6->nexthdr != IPPROTO_TCP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    return handle_tcp_v6(data, data_end, ip6, l4_off);
+}
+
+SEC("xdp/udp6")
+int xdp_udp6(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        inc_stat(STAT_MALFORMED);
+        return XDP_PASS;
+    }
+
+    struct ipv6hdr *ip6 = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv6(data, data_end, &ip6, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+
+    if (ip6->nexthdr != IPPROTO_UDP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    return handle_udp_v6(data, data_end, eth, ip6, l4_off);
 }
 
 SEC("xdp/ipv4")
@@ -893,13 +990,26 @@ int xdp_ipv4(struct xdp_md *ctx)
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) {
-        inc_stat(STAT_MALFORMED);
+    struct iphdr *ip = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv4(data, data_end, &ip, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+
+    if (ip->protocol == IPPROTO_TCP) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_TCP4);
+        inc_stat(STAT_PASSED);
         return XDP_PASS;
     }
 
-    return handle_ipv4(data, data_end, eth);
+    if (ip->protocol == IPPROTO_UDP) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_UDP4);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    inc_stat(STAT_PASSED);
+    return XDP_PASS;
 }
 
 SEC("xdp/ipv6")
@@ -908,13 +1018,26 @@ int xdp_ipv6(struct xdp_md *ctx)
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end) {
-        inc_stat(STAT_MALFORMED);
+    struct ipv6hdr *ip6 = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv6(data, data_end, &ip6, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+
+    if (ip6->nexthdr == IPPROTO_TCP) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_TCP6);
+        inc_stat(STAT_PASSED);
         return XDP_PASS;
     }
 
-    return handle_ipv6(data, data_end, eth);
+    if (ip6->nexthdr == IPPROTO_UDP) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_UDP6);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    inc_stat(STAT_PASSED);
+    return XDP_PASS;
 }
 
 SEC("xdp")

@@ -71,6 +71,10 @@ type XDPFilter struct {
 	program       *ebpf.Program
 	ipv4Program   *ebpf.Program
 	ipv6Program   *ebpf.Program
+	tcp4Program   *ebpf.Program
+	udp4Program   *ebpf.Program
+	tcp6Program   *ebpf.Program
+	udp6Program   *ebpf.Program
 	dispatchRules *ebpf.Map
 	domainRules   *ebpf.Map
 	cidrRules     *ebpf.Map
@@ -96,6 +100,10 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 		Program       *ebpf.Program `ebpf:"xdp_filter"`
 		IPv4Program   *ebpf.Program `ebpf:"xdp_ipv4"`
 		IPv6Program   *ebpf.Program `ebpf:"xdp_ipv6"`
+		TCP4Program   *ebpf.Program `ebpf:"xdp_tcp4"`
+		UDP4Program   *ebpf.Program `ebpf:"xdp_udp4"`
+		TCP6Program   *ebpf.Program `ebpf:"xdp_tcp6"`
+		UDP6Program   *ebpf.Program `ebpf:"xdp_udp6"`
 		DispatchRules *ebpf.Map     `ebpf:"dispatch_rules"`
 		DomainRules   *ebpf.Map     `ebpf:"domain_rules"`
 		CidrRules     *ebpf.Map     `ebpf:"cidr_rules"`
@@ -109,20 +117,20 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 		return nil, fmt.Errorf("load eBPF objects: %w", err)
 	}
 
-	if err := populateDispatchRules(objs.DispatchRules, objs.IPv4Program, objs.IPv6Program); err != nil {
-		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+	if err := populateDispatchRules(objs.DispatchRules, objs.IPv4Program, objs.IPv6Program, objs.TCP4Program, objs.UDP4Program, objs.TCP6Program, objs.UDP6Program); err != nil {
+		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.TCP4Program, objs.UDP4Program, objs.TCP6Program, objs.UDP6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
 		return nil, err
 	}
 
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.TCP4Program, objs.UDP4Program, objs.TCP6Program, objs.UDP6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
 		return nil, fmt.Errorf("find interface %s: %w", ifaceName, err)
 	}
 
 	flags, err := xdpAttachFlags(mode)
 	if err != nil {
-		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.TCP4Program, objs.UDP4Program, objs.TCP6Program, objs.UDP6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
 		return nil, err
 	}
 
@@ -132,7 +140,7 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 		Flags:     flags,
 	})
 	if err != nil {
-		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.TCP4Program, objs.UDP4Program, objs.TCP6Program, objs.UDP6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
 		return nil, fmt.Errorf("attach XDP to %s: %w", ifaceName, err)
 	}
 
@@ -145,6 +153,10 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 		program:       objs.Program,
 		ipv4Program:   objs.IPv4Program,
 		ipv6Program:   objs.IPv6Program,
+		tcp4Program:   objs.TCP4Program,
+		udp4Program:   objs.UDP4Program,
+		tcp6Program:   objs.TCP6Program,
+		udp6Program:   objs.UDP6Program,
 		dispatchRules: objs.DispatchRules,
 		domainRules:   objs.DomainRules,
 		cidrRules:     objs.CidrRules,
@@ -157,22 +169,20 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 	}, nil
 }
 
-func populateDispatchRules(dispatch *ebpf.Map, ipv4, ipv6 *ebpf.Program) error {
+func populateDispatchRules(dispatch *ebpf.Map, ipv4, ipv6, tcp4, udp4, tcp6, udp6 *ebpf.Program) error {
 	if dispatch == nil {
 		return errors.New("dispatch_rules map is missing")
 	}
-	if ipv4 == nil || ipv6 == nil {
+	if ipv4 == nil || ipv6 == nil || tcp4 == nil || udp4 == nil || tcp6 == nil || udp6 == nil {
 		return errors.New("dispatch programs are missing")
 	}
 
-	ipv4Key := uint32(0)
-	if err := dispatch.Put(&ipv4Key, ipv4); err != nil {
-		return fmt.Errorf("put IPv4 dispatch program: %w", err)
-	}
-
-	ipv6Key := uint32(1)
-	if err := dispatch.Put(&ipv6Key, ipv6); err != nil {
-		return fmt.Errorf("put IPv6 dispatch program: %w", err)
+	programs := []*ebpf.Program{ipv4, ipv6, tcp4, udp4, tcp6, udp6}
+	for i, program := range programs {
+		key := uint32(i)
+		if err := dispatch.Put(&key, program); err != nil {
+			return fmt.Errorf("put dispatch program %d: %w", i, err)
+		}
 	}
 
 	return nil
@@ -322,7 +332,7 @@ func (f *XDPFilter) Close() error {
 	if f.xdpLink != nil {
 		_ = f.xdpLink.Close()
 	}
-	closeObjects(f.program, f.ipv4Program, f.ipv6Program, f.dispatchRules, f.domainRules, f.cidrRules, f.cidrV6Rules, f.ipPortRules, f.ipPortV6Rules, f.stats)
+	closeObjects(f.program, f.ipv4Program, f.ipv6Program, f.tcp4Program, f.udp4Program, f.tcp6Program, f.udp6Program, f.dispatchRules, f.domainRules, f.cidrRules, f.cidrV6Rules, f.ipPortRules, f.ipPortV6Rules, f.stats)
 	log.WithField("interface", f.iface).Info("XDP program detached")
 	return nil
 }
