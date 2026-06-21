@@ -753,6 +753,11 @@ static __always_inline int parse_udp_ports(void *data, void *data_end, __u32 l4_
     return -1;
 }
 
+static __always_inline int validate_ipv4(void *data, void *data_end, struct iphdr **out_ip,
+                                         __u32 *out_l4_off);
+static __always_inline int validate_ipv6(void *data, void *data_end, struct ipv6hdr **out_ip6,
+                                         __u32 *out_l4_off);
+
 SEC("xdp/dns4")
 int xdp_dns4(struct xdp_md *ctx)
 {
