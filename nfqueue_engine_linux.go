@@ -61,7 +61,7 @@ func newNFQueueEngine(cfg AppConfig) (Engine, error) {
 func (e *nfQueueEngine) Run(ctx context.Context) error {
 	if e.firewall != nil {
 		if err := e.firewall.Install(ctx); err != nil {
-			return err
+			return explainNFQueueFirewallError(err)
 		}
 		defer func() {
 			if err := e.firewall.Cleanup(context.Background()); err != nil {

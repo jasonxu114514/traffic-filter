@@ -101,6 +101,21 @@ func (f *autoFirewall) Install(ctx context.Context) error {
 	return fmt.Errorf("all firewall backends failed: %s", strings.Join(errs, "; "))
 }
 
+func explainNFQueueFirewallError(err error) error {
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+	missingNFQueue := strings.Contains(lower, "nfqueue revision 0 not supported") ||
+		strings.Contains(lower, "nfnetlink_queue") ||
+		strings.Contains(lower, "xt_nfqueue") ||
+		(strings.Contains(lower, "queue num") && strings.Contains(lower, "no such file or directory")) ||
+		(strings.Contains(lower, "-j nfqueue") && strings.Contains(lower, "no such file or directory"))
+	if !missingNFQueue {
+		return err
+	}
+
+	return fmt.Errorf("%w; kernel NFQUEUE support appears unavailable. This engine requires CONFIG_NETFILTER_NETLINK_QUEUE plus nft_queue or xt_NFQUEUE support. Use a kernel/VPS image that provides nfnetlink_queue/xt_NFQUEUE, or switch to a non-NFQUEUE engine such as a future TUN/AF_XDP path", err)
+}
+
 func (f *autoFirewall) Cleanup(ctx context.Context) error {
 	for _, candidate := range f.candidates {
 		_ = candidate.Cleanup(ctx)

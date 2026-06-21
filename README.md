@@ -166,6 +166,25 @@ sudo iptables-legacy -S | grep NFQUEUE
 sudo ip6tables-legacy -S | grep NFQUEUE
 ```
 
+## NFQUEUE Kernel Support
+
+The `nfqueue` engine requires kernel support for netfilter queueing. If startup
+fails with `NFQUEUE revision 0 not supported`, nftables `queue num` errors, or
+missing `nfnetlink_queue` / `xt_NFQUEUE` modules, the current kernel cannot run
+this engine.
+
+Useful checks:
+
+```bash
+sudo modprobe nfnetlink_queue
+sudo modprobe xt_NFQUEUE
+sudo modprobe nft_queue
+```
+
+If those modules are not present and the features are not built into the
+kernel, use another kernel/VPS image with NFQUEUE enabled or switch to a
+different packet path.
+
 ## Remote Server Test Guide
 
 Run these on the Linux server where traffic reaches the selected hooks.
