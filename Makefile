@@ -1,60 +1,37 @@
-# Traffic Filter — XDP/eBPF based network filter (pure Go + embedded BPF)
-
-BINARY := traffic-filter
+BINARY := middle-filter
 BPF_SRC := bpf/filter.bpf.c
 BPF_OBJ := bpf/filter.bpf.o
 
-.PHONY: all build clean install test help bpf
+CLANG ?= clang
+GO ?= go
+
+.PHONY: all bpf build test clean run help
 
 all: build
 
-# ─── Dependencies ──────────────────────────────────────────────────────────
-deps:
-	@echo "==> Install system dependencies (requires root):"
-	@echo "  Ubuntu/Debian: sudo apt-get install clang llvm libbpf-dev golang-go"
-	@echo "  For vmlinux.h: bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h"
-
-# ─── Build BPF ─────────────────────────────────────────────────────────────
 bpf: $(BPF_OBJ)
 
-$(BPF_OBJ): $(BPF_SRC)
-	@echo "==> Compiling eBPF program..."
-	clang -O2 -g -target bpf -c $(BPF_SRC) -o $(BPF_OBJ)
-	@echo "==> eBPF program compiled: $(BPF_OBJ)"
+$(BPF_OBJ): $(BPF_SRC) bpf/vmlinux.h
+	$(CLANG) -O2 -g -target bpf -D__TARGET_ARCH_x86 -c $(BPF_SRC) -o $(BPF_OBJ)
 
-# ─── Build Go ──────────────────────────────────────────────────────────────
 build: $(BPF_OBJ)
-	@echo "==> Downloading Go dependencies..."
-	go mod tidy
-	@echo "==> Building $(BINARY) (embedding eBPF bytecode)..."
-	go build -o $(BINARY) -v .
-	@echo "==> Build complete: $(BINARY)"
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build -trimpath -o $(BINARY) .
 
-# ─── Clean ─────────────────────────────────────────────────────────────────
+test: $(BPF_OBJ)
+	$(GO) test ./...
+
 clean:
-	@echo "==> Cleaning..."
-	rm -f $(BINARY)
-	rm -f $(BPF_OBJ)
+	rm -f $(BINARY) $(BPF_OBJ)
 
-# ─── Install ───────────────────────────────────────────────────────────────
-install: build
-	@echo "==> Installing to /usr/local/bin..."
-	sudo cp $(BINARY) /usr/local/bin/
-	sudo chmod +x /usr/local/bin/$(BINARY)
+run: build
+	sudo ./$(BINARY) -config config.json
 
-# ─── Test ──────────────────────────────────────────────────────────────────
-test: build
-	@echo "==> Test (requires root and network interface)..."
-	@echo "Run: sudo ./$(BINARY) -iface eth0"
-
-# ─── Help ──────────────────────────────────────────────────────────────────
 help:
-	@echo "Traffic Filter (XDP/eBPF mode) — Build targets:"
-	@echo "  make bpf          Compile eBPF program only"
-	@echo "  make build        Build Go binary (with embedded eBPF)"
-	@echo "  make clean        Remove build artifacts"
-	@echo "  make install      Install to /usr/local/bin"
+	@echo "Targets:"
+	@echo "  make bpf      Compile XDP/eBPF object"
+	@echo "  make build    Build Linux x86_64 binary with embedded BPF"
+	@echo "  make test     Run Go tests after compiling BPF object"
+	@echo "  make clean    Remove build outputs"
 	@echo ""
-	@echo "Run:"
-	@echo "  sudo ./$(BINARY) -iface eth0"
-	@echo "  sudo ./$(BINARY) -iface ens18 -debug"
+	@echo "Example:"
+	@echo "  sudo ./$(BINARY) -config config.json"

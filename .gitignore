@@ -1,30 +1,22 @@
-# Binary (root only)
+# Build outputs
+/middle-filter
 /traffic-filter
-
-# Generated eBPF bindings
-pkg/filter/bpf_bpfel.go
-pkg/filter/bpf_bpfel.o
-pkg/filter/bpf_bpfeb.go
-pkg/filter/bpf_bpfeb.o
-
-# Compiled eBPF
-bpf/traffic_filter.o
 *.o
 
-# Go
-go.sum
-vendor/
+# Local runtime config
+/config.json
 
-# IDE
+# Local/editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# Logs
+# Logs and coverage
 *.log
-
-# Coverage
 coverage.txt
 coverage.html
+
+# Vendored dependencies, if generated locally
+vendor/

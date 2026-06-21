@@ -3,218 +3,340 @@ package main
 import (
 	"bytes"
 	_ "embed"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
 	log "github.com/sirupsen/logrus"
 )
 
 //go:embed bpf/filter.bpf.o
 var bpfProgram []byte
 
-// XDPFilter manages the XDP eBPF program
-type XDPFilter struct {
-	program        *ebpf.Program
-	blockedPorts   *ebpf.Map
-	blockedDomains *ebpf.Map
-	configMap      *ebpf.Map
-	stats          *ebpf.Map
-	xdpLink        link.Link
-	iface          string
+const (
+	maxDomainLen = 96
+
+	domainHTTP      uint32 = 1
+	domainTLS       uint32 = 2
+	domainDNSPoison uint32 = 4
+
+	protoTCP uint8 = 6
+	protoUDP uint8 = 17
+)
+
+var statNames = []string{
+	"total",
+	"passed",
+	"http_blocked",
+	"tls_blocked",
+	"dns_poisoned",
+	"ip_blocked",
+	"ip_port_blocked",
+	"malformed",
 }
 
-// NewXDPFilter creates and loads the XDP filter
-func NewXDPFilter(iface string) (*XDPFilter, error) {
-	// Load eBPF program from embedded bytes
-	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfProgram))
-	if err != nil {
-		return nil, fmt.Errorf("failed to load eBPF spec: %w", err)
+type domainKey [maxDomainLen]byte
+
+type lpmV4Key struct {
+	PrefixLen uint32
+	Addr      uint32
+}
+
+type lpmV6Key struct {
+	PrefixLen uint32
+	Addr      [16]byte
+}
+
+type ipPortKey struct {
+	Addr  uint32
+	Port  uint16
+	Proto uint8
+	Pad   uint8
+}
+
+type ipPortV6Key struct {
+	Addr  [16]byte
+	Port  uint16
+	Proto uint8
+	Pad   uint8
+}
+
+type XDPFilter struct {
+	program       *ebpf.Program
+	domainRules   *ebpf.Map
+	cidrRules     *ebpf.Map
+	cidrV6Rules   *ebpf.Map
+	ipPortRules   *ebpf.Map
+	ipPortV6Rules *ebpf.Map
+	stats         *ebpf.Map
+	xdpLink       link.Link
+	iface         string
+}
+
+func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return nil, fmt.Errorf("remove memlock rlimit: %w", err)
 	}
 
-	// Load into kernel
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfProgram))
+	if err != nil {
+		return nil, fmt.Errorf("load eBPF spec: %w", err)
+	}
+
 	objs := struct {
-		Program        *ebpf.Program `ebpf:"xdp_filter"`
-		BlockedPorts   *ebpf.Map     `ebpf:"blocked_ports"`
-		BlockedDomains *ebpf.Map     `ebpf:"blocked_domains"`
-		ConfigMap      *ebpf.Map     `ebpf:"config_map"`
-		Stats          *ebpf.Map     `ebpf:"stats"`
+		Program       *ebpf.Program `ebpf:"xdp_filter"`
+		DomainRules   *ebpf.Map     `ebpf:"domain_rules"`
+		CidrRules     *ebpf.Map     `ebpf:"cidr_rules"`
+		CidrV6Rules   *ebpf.Map     `ebpf:"cidr_v6_rules"`
+		IPPortRules   *ebpf.Map     `ebpf:"ip_port_rules"`
+		IPPortV6Rules *ebpf.Map     `ebpf:"ip_port_v6_rules"`
+		Stats         *ebpf.Map     `ebpf:"stats"`
 	}{}
 
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		return nil, fmt.Errorf("failed to load eBPF objects: %w", err)
+		return nil, fmt.Errorf("load eBPF objects: %w", err)
 	}
 
-	// Initialize config map with default values
-	cfgKey := uint32(0)
-	cfg := struct {
-		DNSMode uint32
-	}{
-		DNSMode: 0, // Default: DROP
-	}
-	if err := objs.ConfigMap.Put(&cfgKey, &cfg); err != nil {
-		objs.Program.Close()
-		objs.BlockedPorts.Close()
-		objs.BlockedDomains.Close()
-		objs.ConfigMap.Close()
-		objs.Stats.Close()
-		return nil, fmt.Errorf("failed to init config: %w", err)
-	}
-
-	// Get interface
-	ifc, err := net.InterfaceByName(iface)
+	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		objs.Program.Close()
-		objs.BlockedPorts.Close()
-		objs.Stats.Close()
-		return nil, fmt.Errorf("failed to get interface %s: %w", iface, err)
+		closeObjects(objs.Program, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		return nil, fmt.Errorf("find interface %s: %w", ifaceName, err)
 	}
 
-	// Attach XDP program
+	flags, err := xdpAttachFlags(mode)
+	if err != nil {
+		closeObjects(objs.Program, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		return nil, err
+	}
+
 	xdpLink, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.Program,
-		Interface: ifc.Index,
-		Flags:     link.XDPGenericMode, // Use generic mode for compatibility
+		Interface: iface.Index,
+		Flags:     flags,
 	})
 	if err != nil {
-		objs.Program.Close()
-		objs.BlockedPorts.Close()
-		objs.Stats.Close()
-		return nil, fmt.Errorf("failed to attach XDP: %w", err)
+		closeObjects(objs.Program, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		return nil, fmt.Errorf("attach XDP to %s: %w", ifaceName, err)
 	}
 
-	log.WithField("interface", iface).Info("XDP program attached")
+	log.WithFields(log.Fields{
+		"interface": ifaceName,
+		"mode":      mode,
+	}).Info("XDP program attached")
 
 	return &XDPFilter{
-		program:        objs.Program,
-		blockedPorts:   objs.BlockedPorts,
-		blockedDomains: objs.BlockedDomains,
-		configMap:      objs.ConfigMap,
-		stats:          objs.Stats,
-		xdpLink:        xdpLink,
-		iface:          iface,
+		program:       objs.Program,
+		domainRules:   objs.DomainRules,
+		cidrRules:     objs.CidrRules,
+		cidrV6Rules:   objs.CidrV6Rules,
+		ipPortRules:   objs.IPPortRules,
+		ipPortV6Rules: objs.IPPortV6Rules,
+		stats:         objs.Stats,
+		xdpLink:       xdpLink,
+		iface:         ifaceName,
 	}, nil
 }
 
-// BlockPort adds a port to the blocked list
-func (f *XDPFilter) BlockPort(port uint16) error {
-	val := uint8(1)
-	if err := f.blockedPorts.Put(port, val); err != nil {
-		return fmt.Errorf("failed to block port %d: %w", port, err)
+func xdpAttachFlags(mode string) (link.XDPAttachFlags, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "generic":
+		return link.XDPGenericMode, nil
+	case "driver", "native":
+		return link.XDPDriverMode, nil
+	case "auto":
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("unknown XDP mode %q (use generic, driver, or auto)", mode)
 	}
-	log.WithField("port", port).Debug("port blocked in XDP")
-	return nil
 }
 
-// UnblockPort removes a port from the blocked list
-func (f *XDPFilter) UnblockPort(port uint16) error {
-	if err := f.blockedPorts.Delete(port); err != nil {
-		return fmt.Errorf("failed to unblock port %d: %w", port, err)
+func closeObjects(objs ...interface{ Close() error }) {
+	for _, obj := range objs {
+		if obj != nil {
+			_ = obj.Close()
+		}
 	}
-	return nil
 }
 
-// BlockDomain adds a domain to the blocked list
-func (f *XDPFilter) BlockDomain(domain string) error {
-	key := make([]byte, 128)
-	copy(key, domain)
-	val := uint8(1)
-	if err := f.blockedDomains.Put(key, val); err != nil {
-		return fmt.Errorf("failed to block domain %s: %w", domain, err)
+func (f *XDPFilter) AddDomainRule(domain string, flags uint32) (string, error) {
+	key, normalized, err := makeDomainKey(domain)
+	if err != nil {
+		return "", err
 	}
-	log.WithField("domain", domain).Debug("domain blocked in XDP")
-	return nil
+
+	var existing uint32
+	if err := f.domainRules.Lookup(&key, &existing); err == nil {
+		flags |= existing
+	}
+
+	if err := f.domainRules.Put(&key, flags); err != nil {
+		return "", fmt.Errorf("put domain rule %s: %w", normalized, err)
+	}
+
+	return normalized, nil
 }
 
-// UnblockDomain removes a domain from the blocked list
-func (f *XDPFilter) UnblockDomain(domain string) error {
-	key := make([]byte, 128)
-	copy(key, domain)
-	if err := f.blockedDomains.Delete(key); err != nil {
-		return fmt.Errorf("failed to unblock domain %s: %w", domain, err)
+func (f *XDPFilter) AddCIDR(prefix netip.Prefix) (string, error) {
+	prefix = prefix.Masked()
+	val := uint32(1)
+
+	if prefix.Addr().Is4() {
+		addr, err := ipv4MapUint32(prefix.Addr())
+		if err != nil {
+			return "", err
+		}
+		ones := prefix.Bits()
+		if ones < 0 || ones > 32 {
+			return "", fmt.Errorf("invalid IPv4 prefix %s", prefix.String())
+		}
+
+		key := lpmV4Key{
+			PrefixLen: uint32(ones),
+			Addr:      addr,
+		}
+
+		if err := f.cidrRules.Put(&key, val); err != nil {
+			return "", fmt.Errorf("put CIDR rule %s: %w", prefix.String(), err)
+		}
+		return prefix.String(), nil
 	}
-	return nil
+
+	if prefix.Addr().Is6() {
+		ones := prefix.Bits()
+		if ones < 0 || ones > 128 {
+			return "", fmt.Errorf("invalid IPv6 prefix %s", prefix.String())
+		}
+
+		key := lpmV6Key{
+			PrefixLen: uint32(ones),
+			Addr:      prefix.Addr().As16(),
+		}
+
+		if err := f.cidrV6Rules.Put(&key, val); err != nil {
+			return "", fmt.Errorf("put IPv6 CIDR rule %s: %w", prefix.String(), err)
+		}
+		return prefix.String(), nil
+	}
+
+	return "", fmt.Errorf("%s is not an IP prefix", prefix.String())
 }
 
-// SetDNSMode sets the DNS handling mode (0=DROP, 1=POISON)
-func (f *XDPFilter) SetDNSMode(mode int) error {
-	cfgKey := uint32(0)
-	cfg := struct {
-		DNSMode uint32
-	}{
-		DNSMode: uint32(mode),
+func (f *XDPFilter) AddIPPort(addr netip.Addr, port uint16, proto uint8) (string, error) {
+	addr = addr.Unmap()
+	if proto != protoTCP && proto != protoUDP {
+		return "", errors.New("ip+port protocol must be tcp or udp")
 	}
-	if err := f.configMap.Put(&cfgKey, &cfg); err != nil {
-		return fmt.Errorf("failed to set DNS mode: %w", err)
+	val := uint32(1)
+
+	if addr.Is4() {
+		ip, err := ipv4MapUint32(addr)
+		if err != nil {
+			return "", err
+		}
+
+		key := ipPortKey{
+			Addr:  ip,
+			Port:  port,
+			Proto: proto,
+		}
+
+		if err := f.ipPortRules.Put(&key, val); err != nil {
+			return "", fmt.Errorf("put IP+port rule %s:%d/%s: %w", addr.String(), port, protoName(proto), err)
+		}
+		return fmt.Sprintf("%s:%d/%s", addr.String(), port, protoName(proto)), nil
 	}
-	modeStr := "DROP"
-	if mode == 1 {
-		modeStr = "POISON"
+
+	if addr.Is6() {
+		key := ipPortV6Key{
+			Addr:  addr.As16(),
+			Port:  port,
+			Proto: proto,
+		}
+
+		if err := f.ipPortV6Rules.Put(&key, val); err != nil {
+			return "", fmt.Errorf("put IPv6+port rule [%s]:%d/%s: %w", addr.String(), port, protoName(proto), err)
+		}
+		return fmt.Sprintf("[%s]:%d/%s", addr.String(), port, protoName(proto)), nil
 	}
-	log.WithField("mode", modeStr).Debug("DNS mode set")
-	return nil
+
+	return "", fmt.Errorf("%s is not an IP address", addr.String())
 }
 
-// GetStats returns current statistics
-func (f *XDPFilter) GetStats() (total, blocked, passed uint64, err error) {
-	var key uint32
-	var val uint64
-
-	key = 0 // STAT_TOTAL
-	if err := f.stats.Lookup(&key, &val); err == nil {
-		total = val
-	}
-
-	key = 1 // STAT_BLOCKED
-	if err := f.stats.Lookup(&key, &val); err == nil {
-		blocked = val
-	}
-
-	key = 2 // STAT_PASSED
-	if err := f.stats.Lookup(&key, &val); err == nil {
-		passed = val
-	}
-
-	return total, blocked, passed, nil
-}
-
-// GetDetailedStats returns all statistics including HTTP/TLS/DNS counts
-func (f *XDPFilter) GetDetailedStats() (map[string]uint64, error) {
-	stats := make(map[string]uint64)
-	statNames := []string{"total", "blocked", "passed", "http", "tls", "dns", "dns_poisoned"}
+func (f *XDPFilter) GetStats() (map[string]uint64, error) {
+	result := make(map[string]uint64, len(statNames))
 
 	for i, name := range statNames {
 		key := uint32(i)
-		var val uint64
-		if err := f.stats.Lookup(&key, &val); err == nil {
-			stats[name] = val
+		var value uint64
+		if err := f.stats.Lookup(&key, &value); err != nil {
+			return nil, fmt.Errorf("lookup stat %s: %w", name, err)
 		}
+		result[name] = value
 	}
 
-	return stats, nil
+	return result, nil
 }
 
-// Close cleans up resources
 func (f *XDPFilter) Close() error {
 	if f.xdpLink != nil {
-		f.xdpLink.Close()
+		_ = f.xdpLink.Close()
 	}
-	if f.program != nil {
-		f.program.Close()
-	}
-	if f.blockedPorts != nil {
-		f.blockedPorts.Close()
-	}
-	if f.blockedDomains != nil {
-		f.blockedDomains.Close()
-	}
-	if f.configMap != nil {
-		f.configMap.Close()
-	}
-	if f.stats != nil {
-		f.stats.Close()
-	}
-	log.Info("XDP program detached")
+	closeObjects(f.program, f.domainRules, f.cidrRules, f.cidrV6Rules, f.ipPortRules, f.ipPortV6Rules, f.stats)
+	log.WithField("interface", f.iface).Info("XDP program detached")
 	return nil
+}
+
+func makeDomainKey(input string) (domainKey, string, error) {
+	var key domainKey
+
+	normalized := normalizeDomain(input)
+	if normalized == "" {
+		return key, "", errors.New("empty domain")
+	}
+	if len(normalized) >= maxDomainLen {
+		return key, "", fmt.Errorf("domain %q is too long (max %d)", normalized, maxDomainLen-1)
+	}
+
+	copy(key[:], normalized)
+	return key, normalized, nil
+}
+
+func normalizeDomain(input string) string {
+	s := strings.TrimSpace(strings.ToLower(input))
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "https://")
+	if slash := strings.IndexByte(s, '/'); slash >= 0 {
+		s = s[:slash]
+	}
+	if colon := strings.IndexByte(s, ':'); colon >= 0 {
+		s = s[:colon]
+	}
+	return strings.TrimSuffix(s, ".")
+}
+
+func ipv4MapUint32(addr netip.Addr) (uint32, error) {
+	addr = addr.Unmap()
+	if !addr.Is4() {
+		return 0, fmt.Errorf("%s is not an IPv4 address", addr.String())
+	}
+
+	raw := addr.As4()
+	return binary.LittleEndian.Uint32(raw[:]), nil
+}
+
+func protoName(proto uint8) string {
+	switch proto {
+	case protoTCP:
+		return "tcp"
+	case protoUDP:
+		return "udp"
+	default:
+		return fmt.Sprintf("proto%d", proto)
+	}
 }

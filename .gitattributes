@@ -1,0 +1,9 @@
+* text=auto
+
+*.c text eol=lf
+*.h text eol=lf
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.md text eol=lf
+Makefile text eol=lf
