@@ -1,6 +1,5 @@
 {
-  "iface": "ens18",
-  "xdp_mode": "generic",
+  "engine": "nfqueue",
   "debug": false,
   "stats_interval": "5s",
   "rules": {
@@ -9,8 +8,20 @@
     "ips": ["203.0.113.10", "198.51.100.0/24", "2001:db8::/32"],
     "ip_ports": [
       { "ip": "1.2.3.4", "port": 443, "proto": "tcp" },
-      { "ip": "8.8.8.8", "port": 53, "proto": "udp" },
       { "ip": "2001:db8::1", "port": 443, "proto": "tcp" }
     ]
+  },
+  "nfqueue": {
+    "queue_num": 100,
+    "firewall_backend": "auto",
+    "install_rules": true,
+    "chains": ["input", "output", "forward"],
+    "capture": "l7",
+    "fail_open": false,
+    "dns_mode": "nxdomain"
+  },
+  "af_xdp": {
+    "iface": "ens18",
+    "mode": "disabled"
   }
 }

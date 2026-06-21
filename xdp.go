@@ -1,3 +1,5 @@
+//go:build xdp && linux
+
 package main
 
 import (
