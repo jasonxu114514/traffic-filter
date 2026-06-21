@@ -5,9 +5,6 @@ BPF_SRC   := bpf/traffic_filter.c
 BPF_OBJ   := bpf/traffic_filter.o
 CMD_DIR   := ./cmd/traffic-filter
 
-# Prefer clang-14 for stable BPF backend, fallback to clang
-CLANG     := $(shell command -v clang-14 2>/dev/null || command -v clang-17 2>/dev/null || echo clang)
-
 .PHONY: all build clean install test help
 
 all: build
@@ -15,17 +12,16 @@ all: build
 # ─── Dependencies ──────────────────────────────────────────────────────────
 deps:
 	@echo "==> Install system dependencies (requires root):"
-	@echo "  Ubuntu/Debian: sudo apt-get install clang-14 llvm-14 libbpf-dev linux-headers-\$$(uname -r) golang-go"
+	@echo "  Ubuntu/Debian: sudo apt-get install clang llvm libbpf-dev linux-headers-\$$(uname -r) golang-go"
 	@echo "  RHEL/CentOS:   sudo dnf install clang llvm libbpf-devel kernel-devel golang"
 	@echo "  Arch:          sudo pacman -S clang llvm libbpf linux-headers go"
 
 # ─── Build ─────────────────────────────────────────────────────────────────
 $(BPF_OBJ): $(BPF_SRC)
-	@echo "==> Compiling eBPF program with $(CLANG)..."
-	$(CLANG) -O2 -target bpf -c $(BPF_SRC) -o $(BPF_OBJ) \
+	@echo "==> Compiling eBPF program..."
+	clang -O2 -target bpf -c $(BPF_SRC) -o $(BPF_OBJ) \
 		-I/usr/include \
-		-I/usr/include/x86_64-linux-gnu \
-		-Wall
+		-Wall -Werror
 
 build: $(BPF_OBJ)
 	@echo "==> Generating Go bindings + downloading dependencies..."
