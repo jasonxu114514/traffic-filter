@@ -127,7 +127,7 @@ func loadConfig(path string) (AppConfig, error) {
 
 func validateNFQueueConfig(cfg NFQueueConfig) error {
 	switch cfg.FirewallBackend {
-	case "auto", "nftables", "nft", "iptables", "none", "disabled":
+	case "auto", "nftables", "nft", "iptables", "iptables-legacy", "none", "disabled":
 	default:
 		return fmt.Errorf("invalid nfqueue.firewall_backend %q", cfg.FirewallBackend)
 	}

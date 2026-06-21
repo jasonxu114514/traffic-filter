@@ -12,8 +12,6 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const firewallComment = "middle-filter-nfqueue"
-
 func newFirewallManager(cfg NFQueueConfig) (FirewallManager, error) {
 	if !cfg.InstallRules {
 		return nil, nil
@@ -29,7 +27,20 @@ func newFirewallManager(cfg NFQueueConfig) (FirewallManager, error) {
 			candidates = append(candidates, nftFirewall{cfg: cfg})
 		}
 		if _, err := exec.LookPath("iptables"); err == nil {
-			candidates = append(candidates, iptablesFirewall{cfg: cfg})
+			candidates = append(candidates, iptablesFirewall{
+				cfg:     cfg,
+				ipv4Bin: "iptables",
+				ipv6Bin: "ip6tables",
+				label:   "iptables",
+			})
+		}
+		if _, err := exec.LookPath("iptables-legacy"); err == nil {
+			candidates = append(candidates, iptablesFirewall{
+				cfg:     cfg,
+				ipv4Bin: "iptables-legacy",
+				ipv6Bin: "ip6tables-legacy",
+				label:   "iptables-legacy",
+			})
 		}
 		if len(candidates) == 0 {
 			return nil, fmt.Errorf("firewall_backend auto found neither nft nor iptables")
@@ -49,7 +60,22 @@ func newFirewallManager(cfg NFQueueConfig) (FirewallManager, error) {
 		if _, err := exec.LookPath("iptables"); err != nil {
 			return nil, fmt.Errorf("iptables backend selected but iptables was not found: %w", err)
 		}
-		return iptablesFirewall{cfg: cfg}, nil
+		return iptablesFirewall{
+			cfg:     cfg,
+			ipv4Bin: "iptables",
+			ipv6Bin: "ip6tables",
+			label:   "iptables",
+		}, nil
+	case "iptables-legacy":
+		if _, err := exec.LookPath("iptables-legacy"); err != nil {
+			return nil, fmt.Errorf("iptables-legacy backend selected but iptables-legacy was not found: %w", err)
+		}
+		return iptablesFirewall{
+			cfg:     cfg,
+			ipv4Bin: "iptables-legacy",
+			ipv6Bin: "ip6tables-legacy",
+			label:   "iptables-legacy",
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown firewall backend %q", cfg.FirewallBackend)
 	}
@@ -128,7 +154,10 @@ func nftBypass(failOpen bool) string {
 }
 
 type iptablesFirewall struct {
-	cfg NFQueueConfig
+	cfg     NFQueueConfig
+	ipv4Bin string
+	ipv6Bin string
+	label   string
 }
 
 func (f iptablesFirewall) Install(ctx context.Context) error {
@@ -137,25 +166,27 @@ func (f iptablesFirewall) Install(ctx context.Context) error {
 	if err := f.Cleanup(ctx); err != nil {
 		log.WithError(err).Debug("iptables cleanup before install failed")
 	}
-	for _, bin := range []string{"iptables", "ip6tables"} {
+	for _, bin := range []string{f.ipv4Bin, f.ipv6Bin} {
 		if _, err := exec.LookPath(bin); err != nil {
-			if bin == "ip6tables" {
-				log.WithError(err).Warn("ip6tables not found; IPv6 firewall rules were not installed")
+			if bin == f.ipv6Bin {
+				log.WithError(err).WithField("backend", f.label).Warn("IPv6 iptables binary not found; IPv6 firewall rules were not installed")
 				continue
 			}
 			return err
 		}
 		for _, chain := range normalizedChains(f.cfg.Chains) {
 			if f.cfg.Capture == "all" {
-				if err := runCommand(ctx, bin, append([]string{"-I", strings.ToUpper(chain)}, f.commonArgs()...), false); err != nil {
+				if err := runCommand(ctx, bin, append([]string{"-I", strings.ToUpper(chain)}, f.queueArgs()...), false); err != nil {
 					return err
 				}
 				continue
 			}
-			if err := runCommand(ctx, bin, append([]string{"-I", strings.ToUpper(chain), "-p", "tcp", "-m", "multiport", "--dports", "80,443"}, f.commonArgs()...), false); err != nil {
-				return err
+			for _, port := range []string{"80", "443"} {
+				if err := runCommand(ctx, bin, append([]string{"-I", strings.ToUpper(chain), "-p", "tcp", "--dport", port}, f.queueArgs()...), false); err != nil {
+					return err
+				}
 			}
-			if err := runCommand(ctx, bin, append([]string{"-I", strings.ToUpper(chain), "-p", "udp", "--dport", "53"}, f.commonArgs()...), false); err != nil {
+			if err := runCommand(ctx, bin, append([]string{"-I", strings.ToUpper(chain), "-p", "udp", "--dport", "53"}, f.queueArgs()...), false); err != nil {
 				return err
 			}
 		}
@@ -164,31 +195,40 @@ func (f iptablesFirewall) Install(ctx context.Context) error {
 }
 
 func (f iptablesFirewall) Cleanup(ctx context.Context) error {
-	for _, bin := range []string{"iptables", "ip6tables"} {
+	for _, bin := range []string{f.ipv4Bin, f.ipv6Bin} {
 		if _, err := exec.LookPath(bin); err != nil {
 			continue
 		}
 		for _, chain := range normalizedChains(f.cfg.Chains) {
 			if f.cfg.Capture == "all" {
-				_ = runCommand(ctx, bin, append([]string{"-D", strings.ToUpper(chain)}, f.commonArgs()...), true)
+				deleteIPTablesRule(ctx, bin, append([]string{"-D", strings.ToUpper(chain)}, f.queueArgs()...))
 				continue
 			}
-			_ = runCommand(ctx, bin, append([]string{"-D", strings.ToUpper(chain), "-p", "tcp", "-m", "multiport", "--dports", "80,443"}, f.commonArgs()...), true)
-			_ = runCommand(ctx, bin, append([]string{"-D", strings.ToUpper(chain), "-p", "udp", "--dport", "53"}, f.commonArgs()...), true)
+			for _, port := range []string{"80", "443"} {
+				deleteIPTablesRule(ctx, bin, append([]string{"-D", strings.ToUpper(chain), "-p", "tcp", "--dport", port}, f.queueArgs()...))
+			}
+			deleteIPTablesRule(ctx, bin, append([]string{"-D", strings.ToUpper(chain), "-p", "udp", "--dport", "53"}, f.queueArgs()...))
 		}
 	}
 	return nil
 }
 
-func (f iptablesFirewall) commonArgs() []string {
+func (f iptablesFirewall) queueArgs() []string {
 	args := []string{
-		"-m", "comment", "--comment", firewallComment,
 		"-j", "NFQUEUE", "--queue-num", fmt.Sprintf("%d", f.cfg.QueueNum),
 	}
 	if f.cfg.FailOpen {
 		args = append(args, "--queue-bypass")
 	}
 	return args
+}
+
+func deleteIPTablesRule(ctx context.Context, bin string, args []string) {
+	for i := 0; i < 20; i++ {
+		if err := runCommand(ctx, bin, args, false); err != nil {
+			return
+		}
+	}
 }
 
 func normalizedChains(raw []string) []string {

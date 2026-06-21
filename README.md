@@ -116,9 +116,11 @@ Rules:
 
 NFQUEUE options:
 
-- `firewall_backend`: `auto`, `nftables`, `iptables`, `none`, or `disabled`.
+- `firewall_backend`: `auto`, `nftables`, `iptables`, `iptables-legacy`,
+  `none`, or `disabled`.
   `auto` tries `nft` first when present, then falls back to
-  `iptables`/`ip6tables` if nftables rule installation fails.
+  `iptables`/`ip6tables` and `iptables-legacy`/`ip6tables-legacy` if nftables
+  rule installation fails.
 - `install_rules`: when true, rules are installed at startup and removed on a
   clean shutdown.
 - `chains`: any of `input`, `output`, and `forward`.
@@ -155,12 +157,13 @@ nftables:
 sudo nft delete table inet middle_filter
 ```
 
-iptables/ip6tables rules use the comment `middle-filter-nfqueue`. List and
-remove matching rules if needed:
+List and remove matching NFQUEUE rules if needed:
 
 ```bash
-sudo iptables -S | grep middle-filter-nfqueue
-sudo ip6tables -S | grep middle-filter-nfqueue
+sudo iptables -S | grep NFQUEUE
+sudo ip6tables -S | grep NFQUEUE
+sudo iptables-legacy -S | grep NFQUEUE
+sudo ip6tables-legacy -S | grep NFQUEUE
 ```
 
 ## Remote Server Test Guide
