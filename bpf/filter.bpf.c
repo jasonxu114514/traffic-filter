@@ -36,6 +36,8 @@ char LICENSE[] SEC("license") = "GPL";
 #define DISPATCH_TLS4 7
 #define DISPATCH_HTTP6 8
 #define DISPATCH_TLS6 9
+#define DISPATCH_DNS4 10
+#define DISPATCH_DNS6 11
 
 #define STAT_TOTAL 0
 #define STAT_PASSED 1
@@ -130,7 +132,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 10);
+    __uint(max_entries, 12);
     __type(key, __u32);
     __type(value, __u32);
 } dispatch_rules SEC(".maps");
@@ -735,8 +737,9 @@ static __always_inline int run_tls_rule(void *data, void *data_end, __u32 payloa
     return XDP_PASS;
 }
 
-static __noinline int handle_udp_v4(void *data, void *data_end, struct ethhdr *eth,
-                                    struct iphdr *ip, __u32 l4_off)
+static __always_inline int parse_udp_ports(void *data, void *data_end, __u32 l4_off,
+                                           struct udphdr **out_udp, __u16 *sport,
+                                           __u16 *dport)
 {
     struct udphdr *udp = (void *)((char *)data + l4_off);
     if ((void *)(udp + 1) > data_end) {
@@ -744,53 +747,82 @@ static __noinline int handle_udp_v4(void *data, void *data_end, struct ethhdr *e
         return XDP_PASS;
     }
 
-    __u16 sport = bpf_ntohs(udp->source);
-    __u16 dport = bpf_ntohs(udp->dest);
-
-    if (ip_port_matches(ip->daddr, dport, IPPROTO_UDP) ||
-        ip_port_matches(ip->saddr, sport, IPPROTO_UDP)) {
-        inc_stat(STAT_IP_PORT_BLOCKED);
-        return XDP_DROP;
-    }
-
-    if (dport == 53) {
-        int action = check_dns_v4(data, data_end, eth, ip, udp,
-                                  l4_off + sizeof(struct udphdr));
-        if (action != XDP_PASS)
-            return action;
-    }
-
-    inc_stat(STAT_PASSED);
-    return XDP_PASS;
+    *out_udp = udp;
+    *sport = bpf_ntohs(udp->source);
+    *dport = bpf_ntohs(udp->dest);
+    return -1;
 }
 
-static __noinline int handle_udp_v6(void *data, void *data_end, struct ethhdr *eth,
-                                    struct ipv6hdr *ip6, __u32 l4_off)
+SEC("xdp/dns4")
+int xdp_dns4(struct xdp_md *ctx)
 {
-    struct udphdr *udp = (void *)((char *)data + l4_off);
-    if ((void *)(udp + 1) > data_end) {
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
         inc_stat(STAT_MALFORMED);
         return XDP_PASS;
     }
 
-    __u16 sport = bpf_ntohs(udp->source);
-    __u16 dport = bpf_ntohs(udp->dest);
-
-    if (ip6_port_matches(ip6->daddr, dport, IPPROTO_UDP) ||
-        ip6_port_matches(ip6->saddr, sport, IPPROTO_UDP)) {
-        inc_stat(STAT_IP_PORT_BLOCKED);
-        return XDP_DROP;
+    struct iphdr *ip = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv4(data, data_end, &ip, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+    if (ip->protocol != IPPROTO_UDP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
     }
 
-    if (dport == 53) {
-        int action = check_dns_v6(data, data_end, eth, ip6, udp, l4_off,
-                                  l4_off + sizeof(struct udphdr));
-        if (action != XDP_PASS)
-            return action;
+    struct udphdr *udp = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_udp_ports(data, data_end, l4_off, &udp, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+    if (dport != 53) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
     }
 
-    inc_stat(STAT_PASSED);
-    return XDP_PASS;
+    return check_dns_v4(data, data_end, eth, ip, udp,
+                        l4_off + sizeof(struct udphdr));
+}
+
+SEC("xdp/dns6")
+int xdp_dns6(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        inc_stat(STAT_MALFORMED);
+        return XDP_PASS;
+    }
+
+    struct ipv6hdr *ip6 = 0;
+    __u32 l4_off = 0;
+    int verdict = validate_ipv6(data, data_end, &ip6, &l4_off);
+    if (verdict >= 0)
+        return verdict;
+    if (ip6->nexthdr != IPPROTO_UDP) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    struct udphdr *udp = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_udp_ports(data, data_end, l4_off, &udp, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+    if (dport != 53) {
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    return check_dns_v6(data, data_end, eth, ip6, udp, l4_off,
+                        l4_off + sizeof(struct udphdr));
 }
 
 static __always_inline int validate_ipv4(void *data, void *data_end, struct iphdr **out_ip,
@@ -940,7 +972,26 @@ int xdp_udp4(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    return handle_udp_v4(data, data_end, eth, ip, l4_off);
+    struct udphdr *udp = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_udp_ports(data, data_end, l4_off, &udp, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+
+    if (ip_port_matches(ip->daddr, dport, IPPROTO_UDP) ||
+        ip_port_matches(ip->saddr, sport, IPPROTO_UDP)) {
+        inc_stat(STAT_IP_PORT_BLOCKED);
+        return XDP_DROP;
+    }
+
+    if (dport == 53) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_DNS4);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    inc_stat(STAT_PASSED);
+    return XDP_PASS;
 }
 
 SEC("xdp/tcp6")
@@ -1127,7 +1178,26 @@ int xdp_udp6(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    return handle_udp_v6(data, data_end, eth, ip6, l4_off);
+    struct udphdr *udp = 0;
+    __u16 sport = 0, dport = 0;
+    verdict = parse_udp_ports(data, data_end, l4_off, &udp, &sport, &dport);
+    if (verdict >= 0)
+        return verdict;
+
+    if (ip6_port_matches(ip6->daddr, dport, IPPROTO_UDP) ||
+        ip6_port_matches(ip6->saddr, sport, IPPROTO_UDP)) {
+        inc_stat(STAT_IP_PORT_BLOCKED);
+        return XDP_DROP;
+    }
+
+    if (dport == 53) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_DNS6);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
+
+    inc_stat(STAT_PASSED);
+    return XDP_PASS;
 }
 
 SEC("xdp/ipv4")
