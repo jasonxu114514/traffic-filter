@@ -117,7 +117,8 @@ Rules:
 NFQUEUE options:
 
 - `firewall_backend`: `auto`, `nftables`, `iptables`, `none`, or `disabled`.
-  `auto` prefers `nft` if present, otherwise uses `iptables`/`ip6tables`.
+  `auto` tries `nft` first when present, then falls back to
+  `iptables`/`ip6tables` if nftables rule installation fails.
 - `install_rules`: when true, rules are installed at startup and removed on a
   clean shutdown.
 - `chains`: any of `input`, `output`, and `forward`.

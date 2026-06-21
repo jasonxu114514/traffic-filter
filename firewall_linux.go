@@ -24,11 +24,17 @@ func newFirewallManager(cfg NFQueueConfig) (FirewallManager, error) {
 	case "none", "disabled":
 		return nil, nil
 	case "auto":
+		var candidates []FirewallManager
 		if _, err := exec.LookPath("nft"); err == nil {
-			backend = "nftables"
-		} else {
-			backend = "iptables"
+			candidates = append(candidates, nftFirewall{cfg: cfg})
 		}
+		if _, err := exec.LookPath("iptables"); err == nil {
+			candidates = append(candidates, iptablesFirewall{cfg: cfg})
+		}
+		if len(candidates) == 0 {
+			return nil, fmt.Errorf("firewall_backend auto found neither nft nor iptables")
+		}
+		return &autoFirewall{candidates: candidates}, nil
 	case "nft":
 		backend = "nftables"
 	}
@@ -47,6 +53,34 @@ func newFirewallManager(cfg NFQueueConfig) (FirewallManager, error) {
 	default:
 		return nil, fmt.Errorf("unknown firewall backend %q", cfg.FirewallBackend)
 	}
+}
+
+type autoFirewall struct {
+	candidates []FirewallManager
+	active     FirewallManager
+}
+
+func (f *autoFirewall) Install(ctx context.Context) error {
+	var errs []string
+	for _, candidate := range f.candidates {
+		if err := candidate.Install(ctx); err != nil {
+			errs = append(errs, err.Error())
+			log.WithError(err).Warn("firewall backend failed; trying next backend")
+			_ = candidate.Cleanup(context.Background())
+			continue
+		}
+		f.active = candidate
+		return nil
+	}
+	return fmt.Errorf("all firewall backends failed: %s", strings.Join(errs, "; "))
+}
+
+func (f *autoFirewall) Cleanup(ctx context.Context) error {
+	for _, candidate := range f.candidates {
+		_ = candidate.Cleanup(ctx)
+	}
+	f.active = nil
+	return nil
 }
 
 type nftFirewall struct {
@@ -203,7 +237,9 @@ func ensureNFQueueKernelSupport(ctx context.Context) {
 	if _, err := exec.LookPath("modprobe"); err != nil {
 		return
 	}
-	if err := runCommand(ctx, "modprobe", []string{"nfnetlink_queue"}, true); err != nil {
-		log.WithError(err).Debug("modprobe nfnetlink_queue failed")
+	for _, module := range []string{"nfnetlink_queue", "nft_queue", "xt_NFQUEUE"} {
+		if err := runCommand(ctx, "modprobe", []string{module}, true); err != nil {
+			log.WithError(err).WithField("module", module).Debug("modprobe failed")
+		}
 	}
 }
