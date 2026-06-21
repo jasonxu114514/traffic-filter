@@ -35,19 +35,19 @@ func main() {
 		"dns_mode": cfg.DNSMode,
 	}).Info("starting traffic filter")
 
-	fd, ifIdx, err := openRawSocket(cfg.Iface)
+	capFD, _, err := openSockets(cfg.Iface)
 	if err != nil {
-		log.Fatalf("open socket: %v", err)
+		log.Fatalf("open sockets: %v", err)
 	}
-	defer unix.Close(fd)
+	defer unix.Close(capFD)
+	defer unix.Close(injectSock)
 
 	eng := newFilterEngine(cfg)
 
-	// Stats
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	var total, blocked, httpCnt, tlsCnt, dnsCnt, ipBlk, ippBlk, rstCnt uint64
+	var total, blocked, rstCnt, dnsCnt uint64
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -64,19 +64,15 @@ loop:
 		case <-ticker.C:
 			sec := uint64(5)
 			log.WithFields(log.Fields{
-				"total":    total,
-				"blocked":  blocked,
-				"http":     httpCnt,
-				"tls":      tlsCnt,
-				"dns":      dnsCnt,
-				"ip_blk":   ipBlk,
-				"ipp_blk":  ippBlk,
-				"rst":      rstCnt,
+				"total":  total,
+				"blocked": blocked,
+				"rst":    rstCnt,
+				"dns":    dnsCnt,
 				"total/s":  total / sec,
 				"blocked/s": blocked / sec,
 			}).Info("stats")
 		default:
-			n, _, err := unix.Recvfrom(fd, buf, 0)
+			n, _, err := unix.Recvfrom(capFD, buf, 0)
 			if err != nil {
 				continue
 			}
@@ -86,9 +82,6 @@ loop:
 				continue
 			}
 
-			var eth [14]byte
-			copy(eth[:], buf[:14])
-
 			// Only IPv4
 			if u16(buf[12:14]) != 0x0800 {
 				continue
@@ -97,21 +90,22 @@ loop:
 			var ip [20]byte
 			copy(ip[:], buf[14:34])
 
-			v := eng.evaluate(buf, n, ifIdx)
+			v := eng.evaluate(buf, n)
 
 			switch v.action {
 			case "pass":
-				// nothing
 			case "drop":
 				blocked++
 			case "rst":
 				blocked++
 				rstCnt++
-				sendTCPRST(fd, buf, eth, ip, v.tcpOff, ifIdx)
+				sendTCPRST(buf, ip, v.tcpOff)
+				log.WithField("rst", "sent").Debug("TCP RST injected")
 			case "dns-poison":
 				blocked++
 				dnsCnt++
-				sendDNSPoison(fd, buf, eth, ip, v.udpOff, v.dnsOff, ifIdx)
+				sendDNSPoison(buf, ip, v.udpOff, v.dnsOff)
+				log.WithField("poison", "sent").Debug("DNS poison injected")
 			}
 		}
 	}

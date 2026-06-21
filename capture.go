@@ -17,18 +17,23 @@ const (
 	maxBufSz  = 65536
 )
 
-// ─── raw AF_PACKET socket ────────────────────────────────────────────────
+// ─── sockets ─────────────────────────────────────────────────────────────
 
-func openRawSocket(iface string) (int, int, error) {
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW,
+// captureSock is the AF_PACKET socket for reading packets.
+// injectSock is the AF_INET raw socket for sending RST/poison.
+var injectSock int
+
+func openSockets(iface string) (capFD, ifIdx int, err error) {
+	// Capture socket: AF_PACKET
+	capFD, err = unix.Socket(unix.AF_PACKET, unix.SOCK_RAW,
 		int(htons(unix.ETH_P_ALL)))
 	if err != nil {
-		return 0, 0, fmt.Errorf("socket: %w", err)
+		return 0, 0, fmt.Errorf("capture socket: %w", err)
 	}
 
 	ifi, err := net.InterfaceByName(iface)
 	if err != nil {
-		unix.Close(fd)
+		unix.Close(capFD)
 		return 0, 0, fmt.Errorf("interface %s: %w", iface, err)
 	}
 
@@ -36,53 +41,71 @@ func openRawSocket(iface string) (int, int, error) {
 		Protocol: htons(unix.ETH_P_ALL),
 		Ifindex:  ifi.Index,
 	}
-	if err := unix.Bind(fd, &addr); err != nil {
-		unix.Close(fd)
+	if err := unix.Bind(capFD, &addr); err != nil {
+		unix.Close(capFD)
 		return 0, 0, fmt.Errorf("bind: %w", err)
 	}
 
-	log.WithFields(log.Fields{"iface": iface, "idx": ifi.Index}).Info("raw socket open")
-	return fd, ifi.Index, nil
+	// Injection socket: AF_INET + IPPROTO_RAW (full IP header control)
+	injectSock, err = unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_RAW)
+	if err != nil {
+		unix.Close(capFD)
+		return 0, 0, fmt.Errorf("inject socket: %w", err)
+	}
+	// Tell kernel we'll provide our own IP header
+	on := 1
+	unix.SetsockoptInt(injectSock, unix.IPPROTO_IP, unix.IP_HDRINCL, on)
+
+	log.WithFields(log.Fields{"iface": iface, "idx": ifi.Index}).Info("sockets open")
+	return capFD, ifi.Index, nil
 }
 
 func htons(v uint16) uint16 { return (v<<8)&0xff00 | (v>>8)&0x00ff }
 
-// ─── TCP RST injection ───────────────────────────────────────────────────
+// ─── TCP RST injection (via AF_INET raw socket) ──────────────────────────
 
-func sendTCPRST(fd int, buf []byte, eth [14]byte, ip [20]byte,
-	tcpOff int, ifIdx int) {
-
-	var pkt [54]byte
-
-	// Ethernet: swap mac
-	copy(pkt[0:6], eth[6:12])
-	copy(pkt[6:12], eth[0:6])
-	pkt[12] = eth[12]; pkt[13] = eth[13]
-
-	// IP: swap saddr/daddr (ip[12:16]=src, ip[16:20]=dst)
-	copy(pkt[14:34], ip[:])
-	copy(pkt[26:30], ip[16:20]) // new src = orig dst
-	copy(pkt[30:34], ip[12:16]) // new dst = orig src
-	// IP total len = 20 + 20 = 40
-	pkt[16] = 0; pkt[17] = 40
-	pkt[24] = 0; pkt[25] = 0
-	cs := ipChecksum(pkt[14:34])
-	pkt[24] = byte(cs); pkt[25] = byte(cs >> 8)
-
-	// TCP
-	copy(pkt[34:54], buf[tcpOff:tcpOff+20])
-	// swap ports
-	pkt[34], pkt[35] = buf[tcpOff+2], buf[tcpOff+3]
-	pkt[36], pkt[37] = buf[tcpOff+0], buf[tcpOff+1]
-
-	origFlags := buf[tcpOff+13]
+func sendTCPRST(buf []byte, ip [20]byte, tcpOff int) {
+	srcIP := ip[12:16]   // client IP
+	dstIP := ip[16:20]   // server IP
+	srcPort := u16(buf[tcpOff : tcpOff+2])
+	dstPort := u16(buf[tcpOff+2 : tcpOff+4])
 	origSeq := u32(buf[tcpOff+4:])
+	origAck := u32(buf[tcpOff+8:])
+	origFlags := buf[tcpOff+13]
 	origDO := (buf[tcpOff+12] >> 4) & 0x0f
 
+	// Build IP + TCP RST packet
+	ipPkt := make([]byte, 20+20)
+
+	// IP header
+	ipPkt[0] = 0x45              // v4, IHL=5
+	ipPkt[1] = 0                 // DSCP/ECN
+	ipPkt[2] = 0; ipPkt[3] = 40 // total len = 40
+	ipPkt[4] = 0; ipPkt[5] = 0  // ID
+	ipPkt[6] = 0x40; ipPkt[7] = 0 // flags, frag
+	ipPkt[8] = 64                // TTL
+	ipPkt[9] = 6                 // TCP
+	// checksum at 10-11 (fill later)
+	copy(ipPkt[12:16], dstIP) // src = server (pretend)
+	copy(ipPkt[16:20], srcIP) // dst = client
+
+	cs := ipChecksum(ipPkt[:20])
+	ipPkt[10] = byte(cs >> 8); ipPkt[11] = byte(cs)
+
+	// TCP header
+	tcpH := ipPkt[20:]
+	tcpH[0] = byte(dstPort >> 8); tcpH[1] = byte(dstPort) // src = server port
+	tcpH[2] = byte(srcPort >> 8); tcpH[3] = byte(srcPort) // dst = client port
+
 	var seq, ack uint32
-	if origFlags&0x10 != 0 { // ACK
-		seq = u32(buf[tcpOff+8:]) // echo their ack as our seq
-		ack = origSeq + 1
+	if origFlags&0x10 != 0 { // original had ACK
+		// Client sent data → echo client's ack_seq as our seq, ack = client's seq + data_len
+		ipTotal := u16(buf[16:18])
+		ipHL := int(buf[14]&0x0f) * 4
+		tcpHL := int((buf[tcpOff+12]>>4)&0x0f) * 4
+		dataLen := int(ipTotal) - ipHL - tcpHL
+		seq = origAck
+		ack = origSeq + uint32(dataLen)
 	} else {
 		if origFlags&0x02 != 0 { // SYN
 			ack = origSeq + 1
@@ -91,66 +114,64 @@ func sendTCPRST(fd int, buf []byte, eth [14]byte, ip [20]byte,
 		}
 	}
 
-	putU32(pkt[38:], seq)
-	putU32(pkt[42:], ack)
-	pkt[46] = (origDO << 4) | 0x14 // dataoff=orig, RST+ACK
-	pkt[47] = 0 // window=0
-	pkt[48] = 0; pkt[49] = 0
-	pkt[50] = 0; pkt[51] = 0
+	putU32(tcpH[4:], seq)
+	putU32(tcpH[8:], ack)
+	tcpH[12] = (origDO << 4) // data offset (same as original)
+	tcpH[13] = 0x14          // RST+ACK
+	tcpH[14] = 0; tcpH[15] = 0 // window=0
+	tcpH[16] = 0; tcpH[17] = 0 // checksum placeholder
+	tcpH[18] = 0; tcpH[19] = 0 // urgent=0
 
-	cs2 := tcpCS4(pkt[26:30], pkt[30:34], pkt[34:54])
-	pkt[50] = byte(cs2 >> 8); pkt[51] = byte(cs2)
+	tcpCS := tcpCS4(dstIP, srcIP, tcpH)
+	tcpH[16] = byte(tcpCS >> 8); tcpH[17] = byte(tcpCS)
 
-	sendPkt(fd, pkt[:], ifIdx)
+	// Send to client
+	var sa unix.SockaddrInet4
+	copy(sa.Addr[:], srcIP)
+	unix.Sendto(injectSock, ipPkt, 0, &sa)
 }
 
-// ─── DNS poison injection ────────────────────────────────────────────────
+// ─── DNS poison injection (via AF_INET raw socket) ───────────────────────
 
-func sendDNSPoison(fd int, buf []byte, eth [14]byte, ip [20]byte,
-	udpOff, dnsOff, ifIdx int) {
-
+func sendDNSPoison(buf []byte, ip [20]byte, udpOff, dnsOff int) {
+	srcIP := ip[12:16]
+	dstIP := ip[16:20]
+	srcPort := u16(buf[udpOff : udpOff+2])
+	dstPort := u16(buf[udpOff+2 : udpOff+4])
 	dnsLen := len(buf) - dnsOff
-	respLen := 14 + 20 + 8 + dnsLen
-	resp := make([]byte, respLen)
 
-	// Ethernet
-	copy(resp[0:6], eth[6:12])
-	copy(resp[6:12], eth[0:6])
-	resp[12] = eth[12]; resp[13] = eth[13]
+	udpLen := 8 + dnsLen
+	ipTot := 20 + udpLen
+	ipPkt := make([]byte, ipTot)
 
-	// IP: swap saddr/daddr (ip[12:16]=src, ip[16:20]=dst)
-	copy(resp[14:34], ip[:])
-	copy(resp[26:30], ip[16:20]) // new src = orig dst
-	copy(resp[30:34], ip[12:16]) // new dst = orig src
-	ipLen := uint16(20 + 8 + dnsLen)
-	resp[16] = byte(ipLen >> 8); resp[17] = byte(ipLen)
-	resp[24] = 0; resp[25] = 0
-	cs := ipChecksum(resp[14:34])
-	resp[24] = byte(cs); resp[25] = byte(cs >> 8)
+	// IP header
+	ipPkt[0] = 0x45
+	ipPkt[2] = byte(ipTot >> 8); ipPkt[3] = byte(ipTot)
+	ipPkt[6] = 0x40
+	ipPkt[8] = 64
+	ipPkt[9] = 17 // UDP
+	copy(ipPkt[12:16], dstIP) // src = DNS server
+	copy(ipPkt[16:20], srcIP) // dst = client
 
-	// UDP: swap ports
-	copy(resp[34:42], buf[udpOff:udpOff+8])
-	resp[34], resp[35] = buf[udpOff+2], buf[udpOff+3]
-	resp[36], resp[37] = buf[udpOff+0], buf[udpOff+1]
-	udpLen := uint16(8 + dnsLen)
-	resp[38] = byte(udpLen >> 8); resp[39] = byte(udpLen)
-	resp[40] = 0; resp[41] = 0
+	cs := ipChecksum(ipPkt[:20])
+	ipPkt[10] = byte(cs >> 8); ipPkt[11] = byte(cs)
 
-	// DNS: response + NXDOMAIN (RCODE=3)
-	copy(resp[42:], buf[dnsOff:])
-	resp[42+2] = 0x81 // QR=1, RD=1
-	resp[42+3] = 0x83 // RA=1, RCODE=3
-	resp[42+6] = 0; resp[42+7] = 0 // ancount=0
+	// UDP header
+	udpH := ipPkt[20:]
+	udpH[0] = byte(dstPort >> 8); udpH[1] = byte(dstPort)
+	udpH[2] = byte(srcPort >> 8); udpH[3] = byte(srcPort)
+	udpH[4] = byte(udpLen >> 8); udpH[5] = byte(udpLen)
+	udpH[6] = 0; udpH[7] = 0 // checksum 0
 
-	sendPkt(fd, resp, ifIdx)
-}
+	// DNS: copy original query, modify flags → response + NXDOMAIN
+	copy(ipPkt[28:], buf[dnsOff:])
+	ipPkt[28+2] = 0x81 // QR=1, RD=1
+	ipPkt[28+3] = 0x83 // RA=1, RCODE=3
+	ipPkt[28+6] = 0; ipPkt[28+7] = 0 // ancount=0
 
-func sendPkt(fd int, data []byte, ifIdx int) {
-	addr := unix.SockaddrLinklayer{
-		Protocol: htons(unix.ETH_P_IP),
-		Ifindex:  ifIdx,
-	}
-	unix.Sendto(fd, data, 0, &addr)
+	var sa unix.SockaddrInet4
+	copy(sa.Addr[:], srcIP)
+	unix.Sendto(injectSock, ipPkt, 0, &sa)
 }
 
 // ─── checksums ───────────────────────────────────────────────────────────

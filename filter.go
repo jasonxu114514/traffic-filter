@@ -58,14 +58,13 @@ func newFilterEngine(cfg *config) *filterEngine {
 //          plus offsets needed by inject functions
 
 type verdict struct {
-	action        string
-	tcpOff        int  // offset to TCP header
-	udpOff        int
-	dnsOff        int
-	ifIdx         int
+	action string
+	tcpOff int // offset to TCP header in buf
+	udpOff int
+	dnsOff int
 }
 
-func (f *filterEngine) evaluate(buf []byte, n int, ifIdx int) verdict {
+func (f *filterEngine) evaluate(buf []byte, n int) verdict {
 	if n < ethHdrLen+ipHdrLen {
 		return verdict{action: "pass"}
 	}
@@ -104,21 +103,21 @@ func (f *filterEngine) evaluate(buf []byte, n int, ifIdx int) verdict {
 		// 1) IP:Port check
 		if f.ipPorts[ipPortKey{ip: dstKey, port: dport, proto: 6}] ||
 			f.ipPorts[ipPortKey{ip: srcKey, port: sport, proto: 6}] {
-			return verdict{action: "rst", tcpOff: transportOff, ifIdx: ifIdx}
+			return verdict{action: "rst", tcpOff: transportOff}
 		}
 		// 2) IP full block
 		if f.ips[dstKey] || f.ips[srcKey] {
-			return verdict{action: "rst", tcpOff: transportOff, ifIdx: ifIdx}
+			return verdict{action: "rst", tcpOff: transportOff}
 		}
 		// 3) HTTP / TLS domain check → send RST
 		if dport == 80 {
 			if f.checkHTTP(buf, payloadOff, n) {
-				return verdict{action: "rst", tcpOff: transportOff, ifIdx: ifIdx}
+				return verdict{action: "rst", tcpOff: transportOff}
 			}
 		}
 		if dport == 443 {
 			if f.checkTLS(buf, payloadOff, n) {
-				return verdict{action: "rst", tcpOff: transportOff, ifIdx: ifIdx}
+				return verdict{action: "rst", tcpOff: transportOff}
 			}
 		}
 
@@ -144,7 +143,7 @@ func (f *filterEngine) evaluate(buf []byte, n int, ifIdx int) verdict {
 		if dport == 53 {
 			if f.checkDNS(buf, dnsOff, n) {
 				if f.dnsMode == 1 {
-					return verdict{action: "dns-poison", udpOff: transportOff, dnsOff: dnsOff, ifIdx: ifIdx}
+					return verdict{action: "dns-poison", udpOff: transportOff, dnsOff: dnsOff}
 				}
 				return verdict{action: "drop"}
 			}
@@ -314,17 +313,6 @@ func (f *filterEngine) checkDNS(buf []byte, off, n int) bool {
 	if f.domains[d] {
 		log.WithField("dns_query", d).Debug("blocked DNS")
 		return true
-	}
-	return false
-}
-
-// ─── helpers ─────────────────────────────────────────────────────────────
-
-func contains(list []string, s string) bool {
-	for _, item := range list {
-		if item == s {
-			return true
-		}
 	}
 	return false
 }
