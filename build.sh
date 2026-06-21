@@ -23,7 +23,7 @@ echo "[OK] dependencies"
 echo "--- compiling eBPF ---"
 cd bpf
 clang -O2 -target bpf -c traffic_filter.c -o traffic_filter.o \
-    -I/usr/include -Wall -Werror
+    -I/usr/include -I/usr/include/x86_64-linux-gnu -Wall -Werror
 cd ..
 echo "[OK] bpf/traffic_filter.o"
 

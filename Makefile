@@ -21,6 +21,7 @@ $(BPF_OBJ): $(BPF_SRC)
 	@echo "==> Compiling eBPF program..."
 	clang -O2 -target bpf -c $(BPF_SRC) -o $(BPF_OBJ) \
 		-I/usr/include \
+		-I/usr/include/x86_64-linux-gnu \
 		-Wall -Werror
 
 build: $(BPF_OBJ)

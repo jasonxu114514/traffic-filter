@@ -14,7 +14,7 @@ import (
 	"github.com/traffic-filter/pkg/config"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" bpf ../../bpf/traffic_filter.c -- -I/usr/include/bpf
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" bpf ../../bpf/traffic_filter.c -- -I/usr/include/bpf -I/usr/include -I/usr/include/x86_64-linux-gnu
 
 // Stat indices matching the eBPF enum.
 const (
