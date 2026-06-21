@@ -813,8 +813,8 @@ static __noinline int handle_udp_v6(void *data, void *data_end, struct ethhdr *e
     return XDP_PASS;
 }
 
-static __noinline int validate_ipv4(void *data, void *data_end, struct iphdr **out_ip,
-                                    __u32 *out_l4_off)
+static __always_inline int validate_ipv4(void *data, void *data_end, struct iphdr **out_ip,
+                                         __u32 *out_l4_off)
 {
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) {
@@ -862,8 +862,8 @@ static __noinline int validate_ipv4(void *data, void *data_end, struct iphdr **o
     return -1;
 }
 
-static __noinline int validate_ipv6(void *data, void *data_end, struct ipv6hdr **out_ip6,
-                                    __u32 *out_l4_off)
+static __always_inline int validate_ipv6(void *data, void *data_end, struct ipv6hdr **out_ip6,
+                                         __u32 *out_l4_off)
 {
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) {
