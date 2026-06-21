@@ -1,10 +1,8 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"os"
-	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -14,10 +12,7 @@ import (
 
 func main() {
 	// CLI flags
-	mode := flag.String("mode", "local", "Filter mode: local, gateway, all")
-	domains := flag.String("domains", "", "Blocked domains (comma-separated)")
-	blockIPs := flag.String("block-ips", "", "Blocked IPs (comma-separated)")
-	queueNum := flag.Uint("queue", 0, "NFQUEUE queue number")
+	iface := flag.String("iface", "", "Network interface (required)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
@@ -33,51 +28,54 @@ func main() {
 		log.Fatal("This program must be run as root (use sudo)")
 	}
 
-	// Check if nfnetlink_queue module is loaded
-	checkNFQueueModule()
-
-	// Initialize filter
-	filter := NewFilter(*domains, *blockIPs)
-	stats := NewStats()
-
-	log.WithFields(log.Fields{
-		"mode":    *mode,
-		"domains": *domains,
-		"ips":     *blockIPs,
-		"queue":   *queueNum,
-	}).Info("Traffic Filter starting (NFQUEUE mode)")
-
-	// Setup nftables rules
-	nftMgr := NewNFTablesManager(*mode, uint16(*queueNum))
-	if err := nftMgr.Setup(); err != nil {
-		log.WithError(err).Fatal("failed to setup nftables")
+	// Check interface
+	if *iface == "" {
+		log.Fatal("Interface is required (-iface)")
 	}
-	defer func() {
-		log.Info("Cleaning up nftables rules...")
-		nftMgr.Cleanup()
-	}()
 
-	// Create NFQUEUE handler
-	handler, err := NewNFQueueHandler(uint16(*queueNum), filter, stats)
+	log.WithField("interface", *iface).Info("Traffic Filter starting (XDP/eBPF mode)")
+
+	// Load XDP filter
+	xdpFilter, err := NewXDPFilter(*iface)
 	if err != nil {
-		log.WithError(err).Fatal("failed to create nfqueue handler")
+		log.WithError(err).Fatal("failed to load XDP filter")
 	}
-	defer handler.Close()
+	defer xdpFilter.Close()
 
-	// Start stats printer
-	stats.StartPrinter(5 * time.Second)
+	// Block common ports
+	// HTTP
+	if err := xdpFilter.BlockPort(80); err != nil {
+		log.WithError(err).Warn("failed to block port 80")
+	}
+	// HTTPS
+	if err := xdpFilter.BlockPort(443); err != nil {
+		log.WithError(err).Warn("failed to block port 443")
+	}
+	// DNS
+	if err := xdpFilter.BlockPort(53); err != nil {
+		log.WithError(err).Warn("failed to block port 53")
+	}
 
-	// Start NFQUEUE processing
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	log.Info("Ports 80, 443, 53 blocked. Press Ctrl+C to stop.")
+
+	// Print stats periodically
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
 	go func() {
-		if err := handler.Start(ctx); err != nil {
-			log.WithError(err).Error("nfqueue handler error")
+		for range ticker.C {
+			total, blocked, passed, err := xdpFilter.GetStats()
+			if err != nil {
+				log.WithError(err).Warn("failed to get stats")
+				continue
+			}
+			log.WithFields(log.Fields{
+				"total":   total,
+				"blocked": blocked,
+				"passed":  passed,
+			}).Info("XDP stats")
 		}
 	}()
-
-	log.Info("Filter active. Press Ctrl+C to stop.")
 
 	// Wait for signal
 	sigCh := make(chan os.Signal, 1)
@@ -85,18 +83,12 @@ func main() {
 	<-sigCh
 
 	log.Info("Shutting down...")
-	cancel()
-	time.Sleep(time.Second)
 
 	// Print final stats
-	stats.Print()
-}
-
-// checkNFQueueModule checks and loads nfnetlink_queue module if needed
-func checkNFQueueModule() {
-	// Try to load the module
-	cmd := exec.Command("modprobe", "nfnetlink_queue")
-	if err := cmd.Run(); err != nil {
-		log.WithError(err).Warn("failed to load nfnetlink_queue module (may already be loaded)")
-	}
+	total, blocked, passed, _ := xdpFilter.GetStats()
+	log.WithFields(log.Fields{
+		"total_packets":   total,
+		"blocked_packets": blocked,
+		"passed_packets":  passed,
+	}).Info("final statistics")
 }

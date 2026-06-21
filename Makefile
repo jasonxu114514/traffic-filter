@@ -1,33 +1,40 @@
-# Traffic Filter — NFQUEUE based network filter (pure Go)
+# Traffic Filter — XDP/eBPF based network filter (pure Go + embedded BPF)
 
 BINARY := traffic-filter
+BPF_SRC := bpf/filter.bpf.c
+BPF_OBJ := bpf/filter.bpf.o
 
-.PHONY: all build clean install test help
+.PHONY: all build clean install test help bpf
 
 all: build
 
 # ─── Dependencies ──────────────────────────────────────────────────────────
 deps:
 	@echo "==> Install system dependencies (requires root):"
-	@echo "  Ubuntu/Debian: sudo apt-get install iptables golang-go"
-	@echo "  RHEL/CentOS:   sudo dnf install iptables golang"
-	@echo "  Arch:          sudo pacman -S iptables go"
-	@echo ""
-	@echo "==> Check nfnetlink_queue module:"
-	@echo "  lsmod | grep nfnetlink_queue"
-	@echo "  sudo modprobe nfnetlink_queue"
+	@echo "  Ubuntu/Debian: sudo apt-get install clang llvm libbpf-dev golang-go"
+	@echo "  For vmlinux.h: bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h"
 
-# ─── Build ─────────────────────────────────────────────────────────────────
-build:
+# ─── Build BPF ─────────────────────────────────────────────────────────────
+bpf: $(BPF_OBJ)
+
+$(BPF_OBJ): $(BPF_SRC)
+	@echo "==> Compiling eBPF program..."
+	clang -O2 -g -target bpf -c $(BPF_SRC) -o $(BPF_OBJ)
+	@echo "==> eBPF program compiled: $(BPF_OBJ)"
+
+# ─── Build Go ──────────────────────────────────────────────────────────────
+build: $(BPF_OBJ)
 	@echo "==> Downloading Go dependencies..."
 	go mod tidy
-	@echo "==> Building $(BINARY)..."
+	@echo "==> Building $(BINARY) (embedding eBPF bytecode)..."
 	go build -o $(BINARY) -v .
+	@echo "==> Build complete: $(BINARY)"
 
 # ─── Clean ─────────────────────────────────────────────────────────────────
 clean:
 	@echo "==> Cleaning..."
 	rm -f $(BINARY)
+	rm -f $(BPF_OBJ)
 
 # ─── Install ───────────────────────────────────────────────────────────────
 install: build
@@ -37,27 +44,17 @@ install: build
 
 # ─── Test ──────────────────────────────────────────────────────────────────
 test: build
-	@echo "==> Test run (5 seconds)..."
-	sudo timeout 5s ./$(BINARY) -mode local -domains "example.com" || true
-
-# ─── Lint / fmt / vet ─────────────────────────────────────────────────────
-fmt:
-	go fmt ./...
-
-vet:
-	go vet ./...
+	@echo "==> Test (requires root and network interface)..."
+	@echo "Run: sudo ./$(BINARY) -iface eth0"
 
 # ─── Help ──────────────────────────────────────────────────────────────────
 help:
-	@echo "Traffic Filter (NFQUEUE mode) — Build targets:"
-	@echo "  make build        Build Go binary"
-	@echo "  make clean        Remove binary"
+	@echo "Traffic Filter (XDP/eBPF mode) — Build targets:"
+	@echo "  make bpf          Compile eBPF program only"
+	@echo "  make build        Build Go binary (with embedded eBPF)"
+	@echo "  make clean        Remove build artifacts"
 	@echo "  make install      Install to /usr/local/bin"
-	@echo "  make test         Quick smoke test"
-	@echo "  make fmt          Format Go source"
-	@echo "  make vet          Run go vet"
 	@echo ""
 	@echo "Run:"
-	@echo "  sudo ./$(BINARY) -mode local -domains \"a.com,b.com\""
-	@echo "  sudo ./$(BINARY) -mode gateway -domains \"a.com\""
-	@echo "  sudo ./$(BINARY) -mode all -domains \"a.com\" -block-ips \"1.2.3.4\""
+	@echo "  sudo ./$(BINARY) -iface eth0"
+	@echo "  sudo ./$(BINARY) -iface ens18 -debug"
