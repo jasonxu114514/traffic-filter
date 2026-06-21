@@ -79,9 +79,9 @@ static __always_inline int is_domain_blocked(char *domain, int len, void *data_e
     // Limit length
     if (len > MAX_DOMAIN_LEN - 1) len = MAX_DOMAIN_LEN - 1;
 
-    // Copy domain to fixed-size key (simple byte-by-byte copy)
+    // Copy domain to fixed-size key (limited to 64 bytes to reduce instructions)
     #pragma unroll
-    for (int i = 0; i < MAX_DOMAIN_LEN; i++) {
+    for (int i = 0; i < 64; i++) {
         if (i >= len) break;
         if (domain + i >= (char *)data_end) break;
         key[i] = domain[i];
@@ -98,7 +98,7 @@ static __always_inline int parse_dns_name(char *in, char *out, void *data_end) {
     int pos = 0, out_pos = 0;
 
     #pragma unroll
-    for (int i = 0; i < 64; i++) {
+    for (int i = 0; i < 32; i++) {  // Reduced from 64
         if (in + pos >= (char *)data_end) break;
 
         __u8 len = in[pos];
@@ -113,9 +113,9 @@ static __always_inline int parse_dns_name(char *in, char *out, void *data_end) {
             out[out_pos++] = '.';
         }
 
-        // Copy label
+        // Copy label (reduced to 32 to save instructions)
         #pragma unroll
-        for (int j = 0; j < 63; j++) {
+        for (int j = 0; j < 32; j++) {  // Reduced from 63
             if (j >= len || out_pos >= MAX_DOMAIN_LEN - 1) break;
             if (in + pos >= (char *)data_end) return -1;
             out[out_pos++] = in[pos++];
@@ -234,9 +234,9 @@ static __always_inline int check_http_host(void *data, void *data_end, __u32 off
 
     inc_stat(STAT_HTTP);
 
-    // Search for "Host: " header (limited to 256 bytes)
+    // Search for "Host: " header (limited to 128 bytes, 16 iterations)
     #pragma unroll
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < 16; i++) {  // Reduced from 32
         int offset = i * 8;
         if (p + offset + 6 > (char *)data_end) break;
 
@@ -247,9 +247,9 @@ static __always_inline int check_http_host(void *data, void *data_end, __u32 off
             char *host = p + offset + 6;
             int host_len = 0;
 
-            // Find end of host (CR/LF/space)
+            // Find end of host (CR/LF/space) - reduced to 64 iterations
             #pragma unroll
-            for (int j = 0; j < MAX_DOMAIN_LEN; j++) {
+            for (int j = 0; j < 64; j++) {  // Reduced from MAX_DOMAIN_LEN
                 if (host + j >= (char *)data_end) break;
                 if (host[j]=='\r' || host[j]=='\n' || host[j]==' ') {
                     host_len = j;
@@ -307,9 +307,9 @@ static __always_inline int check_tls_sni(void *data, void *data_end, __u32 off) 
     if (p + pos + 2 > (char *)data_end) return XDP_PASS;
     pos += 2;
 
-    // Iterate through extensions (limit to 16)
+    // Iterate through extensions (limit to 12 instead of 16)
     #pragma unroll
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 12; i++) {
         if (p + pos + 4 > (char *)data_end) break;
 
         __u16 ext_type = (p[pos] << 8) | p[pos + 1];
