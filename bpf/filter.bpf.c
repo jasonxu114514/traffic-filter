@@ -93,6 +93,13 @@ struct {
 } domain_rules SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct domain_key);
+} scratch_domain SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 4096);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -224,21 +231,25 @@ static __noinline int domain_from_packet_matches(void *data, void *data_end,
     if (off >= MAX_PACKET_READ || len > MAX_PACKET_READ - off)
         return 0;
 
-    struct domain_key key = {};
+    __u32 scratch_idx = 0;
+    struct domain_key *key = bpf_map_lookup_elem(&scratch_domain, &scratch_idx);
+    if (!key)
+        return 0;
 
     NO_UNROLL
     for (int i = 0; i < MAX_DOMAIN_LEN; i++) {
+        key->name[i] = 0;
         if ((__u32)i >= len)
-            break;
+            continue;
 
         __u8 c = 0;
         if (!load_u8(data, data_end, off + i, &c))
             return 0;
 
-        key.name[i] = ascii_lower(c);
+        key->name[i] = ascii_lower(c);
     }
 
-    return domain_matches(&key, len, action);
+    return domain_matches(key, len, action);
 }
 
 static __noinline int ip_matches_cidr(__u32 addr)
@@ -538,7 +549,15 @@ static __noinline int dns_domain_matches(void *data, void *data_end,
     if (bpf_ntohs(dns->qdcount) == 0)
         return 0;
 
-    struct domain_key key = {};
+    __u32 scratch_idx = 0;
+    struct domain_key *key = bpf_map_lookup_elem(&scratch_domain, &scratch_idx);
+    if (!key)
+        return 0;
+
+    NO_UNROLL
+    for (int i = 0; i < MAX_DOMAIN_LEN; i++)
+        key->name[i] = 0;
+
     __u32 pos = dns_off + sizeof(struct dnshdr);
     __u32 out = 0;
     __u8 label_remaining = 0;
@@ -572,7 +591,7 @@ static __noinline int dns_domain_matches(void *data, void *data_end,
             if (out > 0) {
                 if (out >= MAX_DOMAIN_LEN - 1)
                     return 0;
-                key.name[out++] = '.';
+                key->name[out++] = '.';
             }
             continue;
         }
@@ -586,7 +605,7 @@ static __noinline int dns_domain_matches(void *data, void *data_end,
         if (!load_u8(data, data_end, pos, &c))
             return 0;
 
-        key.name[out++] = ascii_lower(c);
+        key->name[out++] = ascii_lower(c);
         pos++;
         label_remaining--;
     }
@@ -596,7 +615,7 @@ static __noinline int dns_domain_matches(void *data, void *data_end,
     if (pos > dns_end || dns_end - pos < 4)
         return 0;
 
-    return domain_matches(&key, out, DOMAIN_DNS_POISON);
+    return domain_matches(key, out, DOMAIN_DNS_POISON);
 }
 
 static __always_inline int poison_dns_nxdomain_v4(struct ethhdr *eth, struct iphdr *ip,
