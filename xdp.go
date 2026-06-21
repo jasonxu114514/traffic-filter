@@ -20,7 +20,7 @@ import (
 var bpfProgram []byte
 
 const (
-	maxDomainLen = 96
+	maxDomainLen = 64
 
 	domainHTTP      uint32 = 1
 	domainTLS       uint32 = 2

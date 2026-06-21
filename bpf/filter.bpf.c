@@ -15,10 +15,10 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define NO_UNROLL _Pragma("clang loop unroll(disable)")
 
-#define MAX_DOMAIN_LEN 96
+#define MAX_DOMAIN_LEN 64
 #define MAX_TLS_SCAN 512
-#define MAX_DNS_SCAN 128
-#define MAX_DNS_LABELS 16
+#define MAX_DNS_SCAN 64
+#define MAX_DNS_LABELS 8
 #define MAX_PACKET_READ 1024
 
 #define DOMAIN_HTTP 1

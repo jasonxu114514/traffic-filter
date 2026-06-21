@@ -101,7 +101,7 @@ Rules:
   `/128` for IPv6.
 - `ip_ports`: structured IP, port, and protocol rules. `proto` may be `tcp` or
   `udp`; empty `proto` defaults to `tcp`.
-- Domain rules are limited to 95 bytes after normalization.
+- Domain rules are limited to 63 bytes after normalization.
 
 ## IPv6 Notes
 
