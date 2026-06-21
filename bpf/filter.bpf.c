@@ -371,30 +371,7 @@ static __noinline int check_http_host_at(void *data, void *data_end,
 
 static __noinline int check_http_host(void *data, void *data_end, __u32 payload_off)
 {
-    int action = XDP_PASS;
-
-    action = check_http_host_at(data, data_end, payload_off, 16);
-    if (action == XDP_DROP)
-        return action;
-    action = check_http_host_at(data, data_end, payload_off, 17);
-    if (action == XDP_DROP)
-        return action;
-    action = check_http_host_at(data, data_end, payload_off, 18);
-    if (action == XDP_DROP)
-        return action;
-    action = check_http_host_at(data, data_end, payload_off, 19);
-    if (action == XDP_DROP)
-        return action;
-    action = check_http_host_at(data, data_end, payload_off, 20);
-    if (action == XDP_DROP)
-        return action;
-    action = check_http_host_at(data, data_end, payload_off, 24);
-    if (action == XDP_DROP)
-        return action;
-    action = check_http_host_at(data, data_end, payload_off, 32);
-    if (action == XDP_DROP)
-        return action;
-    return check_http_host_at(data, data_end, payload_off, 48);
+    return check_http_host_at(data, data_end, payload_off, 16);
 }
 
 static __noinline int check_tls_sni(void *data, void *data_end, __u32 payload_off)
