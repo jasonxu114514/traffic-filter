@@ -21,7 +21,6 @@ char LICENSE[] SEC("license") = "GPL";
 #define MAX_DNS_SCAN 128
 #define MAX_DNS_LABELS 16
 #define MAX_PACKET_READ 1024
-#define MAX_UDP_CSUM_WORDS 512
 
 #define DOMAIN_HTTP 1
 #define DOMAIN_TLS 2
@@ -158,21 +157,6 @@ static __always_inline int load_be16(void *data, void *data_end, __u32 off, __u1
     return 1;
 }
 
-static __always_inline __u32 csum_add(__u32 sum, __u32 addend)
-{
-    sum += addend;
-    return sum + (sum < addend);
-}
-
-static __always_inline __u16 csum_fold(__u32 sum)
-{
-    NO_UNROLL
-    for (int i = 0; i < 4; i++)
-        sum = (sum & 0xffff) + (sum >> 16);
-
-    return (__u16)~sum;
-}
-
 static __always_inline void swap_macs(struct ethhdr *eth)
 {
     __u8 tmp = 0;
@@ -183,6 +167,21 @@ static __always_inline void swap_macs(struct ethhdr *eth)
         eth->h_source[i] = eth->h_dest[i];
         eth->h_dest[i] = tmp;
     }
+}
+
+static __always_inline __u16 csum_replace16(__u16 check, __u16 old, __u16 new)
+{
+    __u32 sum = (~bpf_ntohs(check)) & 0xffff;
+
+    sum += (~bpf_ntohs(old)) & 0xffff;
+    sum += bpf_ntohs(new);
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+
+    __u16 out = (__u16)~sum;
+    if (out == 0)
+        out = 0xffff;
+    return bpf_htons(out);
 }
 
 static __noinline int domain_matches(struct domain_key *key, __u32 len, __u32 action)
@@ -585,59 +584,10 @@ static __always_inline int poison_dns_nxdomain_v4(struct ethhdr *eth, struct iph
     return XDP_TX;
 }
 
-static __always_inline __u16 udp6_checksum(void *data, void *data_end,
-                                           struct ipv6hdr *ip6,
-                                           __u32 udp_off, __u16 udp_len)
-{
-    __u32 sum = 0;
-
-    NO_UNROLL
-    for (int i = 0; i < 16; i += 2) {
-        sum = csum_add(sum, ((__u32)ip6->saddr[i] << 8) | ip6->saddr[i + 1]);
-        sum = csum_add(sum, ((__u32)ip6->daddr[i] << 8) | ip6->daddr[i + 1]);
-    }
-
-    sum = csum_add(sum, udp_len);
-    sum = csum_add(sum, IPPROTO_UDP);
-
-    NO_UNROLL
-    for (int i = 0; i < MAX_UDP_CSUM_WORDS; i++) {
-        __u32 rel = (__u32)i * 2;
-        if (rel >= udp_len)
-            break;
-
-        __u32 off = udp_off + rel;
-        __u32 word = 0;
-
-        if (rel == 6) {
-            word = 0;
-        } else if (rel + 1 < udp_len) {
-            __u16 tmp = 0;
-            if (!load_be16(data, data_end, off, &tmp))
-                return 0;
-            word = tmp;
-        } else {
-            __u8 tmp = 0;
-            if (!load_u8(data, data_end, off, &tmp))
-                return 0;
-            word = ((__u32)tmp) << 8;
-        }
-
-        sum = csum_add(sum, word);
-    }
-
-    __u16 folded = csum_fold(sum);
-    if (folded == 0)
-        folded = 0xffff;
-    return folded;
-}
-
-static __always_inline int poison_dns_nxdomain_v6(void *data, void *data_end,
-                                                  struct ethhdr *eth,
+static __always_inline int poison_dns_nxdomain_v6(struct ethhdr *eth,
                                                   struct ipv6hdr *ip6,
                                                   struct udphdr *udp,
-                                                  struct dnshdr *dns,
-                                                  __u32 udp_off)
+                                                  struct dnshdr *dns)
 {
     swap_macs(eth);
 
@@ -653,17 +603,20 @@ static __always_inline int poison_dns_nxdomain_v6(void *data, void *data_end,
     udp->source = udp->dest;
     udp->dest = port_tmp;
 
+    __u16 old_flags = dns->flags;
+    __u16 old_ancount = dns->ancount;
+    __u16 old_nscount = dns->nscount;
+    __u16 old_arcount = dns->arcount;
+
     dns->flags = bpf_htons(0x8183);
     dns->ancount = 0;
     dns->nscount = 0;
     dns->arcount = 0;
 
-    __u16 udp_len = bpf_ntohs(udp->len);
-    udp->check = 0;
-    __u16 csum = udp6_checksum(data, data_end, ip6, udp_off, udp_len);
-    if (csum == 0)
-        return XDP_DROP;
-    udp->check = bpf_htons(csum);
+    udp->check = csum_replace16(udp->check, old_flags, dns->flags);
+    udp->check = csum_replace16(udp->check, old_ancount, dns->ancount);
+    udp->check = csum_replace16(udp->check, old_nscount, dns->nscount);
+    udp->check = csum_replace16(udp->check, old_arcount, dns->arcount);
 
     inc_stat(STAT_DNS_POISONED);
     return XDP_TX;
@@ -709,7 +662,7 @@ static __always_inline int check_dns_v6(void *data, void *data_end, struct ethhd
     if ((void *)(dns + 1) > data_end)
         return XDP_PASS;
 
-    return poison_dns_nxdomain_v6(data, data_end, eth, ip6, udp, dns, udp_off);
+    return poison_dns_nxdomain_v6(eth, ip6, udp, dns);
 }
 
 static __noinline int handle_tcp_common(void *data, void *data_end,
