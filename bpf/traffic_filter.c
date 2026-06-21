@@ -424,12 +424,6 @@ static __always_inline int check_blocked_ip_port(__u32 ip_addr, __u16 port,
     return 0;
 }
 
-// 提取目標地址和端口
-static __always_inline void extract_dst(struct iphdr *ip,
-                                         __u32 *dst_ip, __u16 *dst_port) {
-    *dst_ip = ip->daddr;
-}
-
 // ─── IPv4 處理入口 ──────────────────────────────────────────────────────
 
 static __always_inline int handle_ipv4(struct xdp_md *ctx, struct ethhdr *eth,
