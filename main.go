@@ -47,14 +47,14 @@ func main() {
 		"queue":   *queueNum,
 	}).Info("Traffic Filter starting (NFQUEUE mode)")
 
-	// Setup iptables rules
-	iptMgr := NewIPTablesManager(*mode, uint16(*queueNum))
-	if err := iptMgr.Setup(); err != nil {
-		log.WithError(err).Fatal("failed to setup iptables")
+	// Setup nftables rules
+	nftMgr := NewNFTablesManager(*mode, uint16(*queueNum))
+	if err := nftMgr.Setup(); err != nil {
+		log.WithError(err).Fatal("failed to setup nftables")
 	}
 	defer func() {
-		log.Info("Cleaning up iptables rules...")
-		iptMgr.Cleanup()
+		log.Info("Cleaning up nftables rules...")
+		nftMgr.Cleanup()
 	}()
 
 	// Create NFQUEUE handler
