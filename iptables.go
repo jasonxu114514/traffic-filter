@@ -26,25 +26,25 @@ func NewNFTablesManager(mode string, queueNum uint16) *NFTablesManager {
 
 // Setup adds nftables rules based on mode
 func (m *NFTablesManager) Setup() error {
-	// Create table if not exists
-	cmd := exec.Command("nft", "add", "table", "inet", "filter")
+	// Create table
+	cmd := exec.Command("nft", "add", "table", "inet", "traffic_filter")
 	if output, err := cmd.CombinedOutput(); err != nil {
-		// Ignore if table already exists
-		if !strings.Contains(string(output), "File exists") {
-			log.WithError(err).WithField("output", string(output)).Debug("table creation info")
+		if !strings.Contains(string(output), "File exists") && !strings.Contains(string(output), "exists") {
+			return fmt.Errorf("failed to create table: %w, output: %s", err, string(output))
 		}
 	}
 
 	chains := m.getChains()
 
 	for _, chain := range chains {
-		// Create chain if not exists
-		chainName := strings.ToLower(chain)
-		cmd := exec.Command("nft", "add", "chain", "inet", "filter", chainName,
-			fmt.Sprintf("{ type filter hook %s priority 0 ; }", chainName))
+		// Create chain - use separate command for hook definition
+		chainName := fmt.Sprintf("tf_%s", chain)
+		hookType := fmt.Sprintf("{ type filter hook %s priority 0 ; policy accept ; }", chain)
+
+		cmd := exec.Command("nft", "add", "chain", "inet", "traffic_filter", chainName, hookType)
 		if output, err := cmd.CombinedOutput(); err != nil {
-			if !strings.Contains(string(output), "File exists") {
-				log.WithError(err).WithField("output", string(output)).Debug("chain creation info")
+			if !strings.Contains(string(output), "File exists") && !strings.Contains(string(output), "exists") {
+				log.WithError(err).WithField("output", string(output)).Warn("chain creation failed")
 			}
 		}
 
@@ -75,30 +75,20 @@ func (m *NFTablesManager) Setup() error {
 
 // Cleanup removes all added nftables rules
 func (m *NFTablesManager) Cleanup() error {
-	// Remove rules in reverse order
-	for i := len(m.rules) - 1; i >= 0; i-- {
-		rule := m.rules[i]
-		parts := strings.Fields(rule)
-
-		// Change "add rule" to "delete rule"
-		if len(parts) >= 2 && parts[0] == "add" {
-			parts[0] = "delete"
-		}
-
-		cmd := exec.Command("nft", parts...)
-		if err := cmd.Run(); err != nil {
-			log.WithError(err).WithField("rule", rule).Warn("failed to remove nftables rule")
-		}
+	// Simply delete the entire table
+	cmd := exec.Command("nft", "delete", "table", "inet", "traffic_filter")
+	if err := cmd.Run(); err != nil {
+		log.WithError(err).Warn("failed to delete nftables table")
 	}
 
-	log.WithField("count", len(m.rules)).Info("nftables rules removed")
+	log.Info("nftables rules removed")
 	return nil
 }
 
 // addRule adds a single nftables rule
 func (m *NFTablesManager) addRule(chain, proto, port string) error {
-	// nft add rule inet filter output tcp dport 80 queue num 0
-	rule := fmt.Sprintf("add rule inet filter %s %s dport %s queue num %d",
+	// nft add rule inet traffic_filter tf_output tcp dport 80 queue to 0
+	rule := fmt.Sprintf("add rule inet traffic_filter %s %s dport %s queue to %d",
 		chain, proto, port, m.queueNum)
 
 	parts := strings.Fields(rule)
