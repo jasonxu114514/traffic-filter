@@ -54,21 +54,27 @@ type nftFirewall struct {
 }
 
 func (f nftFirewall) Install(ctx context.Context) error {
+	ensureNFQueueKernelSupport(ctx)
+
 	if err := f.Cleanup(ctx); err != nil {
 		log.WithError(err).Debug("nft cleanup before install failed")
 	}
 
 	var script strings.Builder
-	script.WriteString("add table inet middle_filter\n")
+	script.WriteString("table inet middle_filter {\n")
 	for _, chain := range normalizedChains(f.cfg.Chains) {
-		script.WriteString(fmt.Sprintf("add chain inet middle_filter %s { type filter hook %s priority 0; policy accept; }\n", chain, chain))
+		script.WriteString(fmt.Sprintf("  chain %s {\n", chain))
+		script.WriteString(fmt.Sprintf("    type filter hook %s priority 0; policy accept;\n", chain))
 		if f.cfg.Capture == "all" {
-			script.WriteString(fmt.Sprintf("add rule inet middle_filter %s queue num %d%s\n", chain, f.cfg.QueueNum, nftBypass(f.cfg.FailOpen)))
+			script.WriteString(fmt.Sprintf("    queue num %d%s\n", f.cfg.QueueNum, nftBypass(f.cfg.FailOpen)))
+			script.WriteString("  }\n")
 			continue
 		}
-		script.WriteString(fmt.Sprintf("add rule inet middle_filter %s tcp dport { 80, 443 } queue num %d%s\n", chain, f.cfg.QueueNum, nftBypass(f.cfg.FailOpen)))
-		script.WriteString(fmt.Sprintf("add rule inet middle_filter %s udp dport 53 queue num %d%s\n", chain, f.cfg.QueueNum, nftBypass(f.cfg.FailOpen)))
+		script.WriteString(fmt.Sprintf("    tcp dport { 80, 443 } queue num %d%s\n", f.cfg.QueueNum, nftBypass(f.cfg.FailOpen)))
+		script.WriteString(fmt.Sprintf("    udp dport 53 queue num %d%s\n", f.cfg.QueueNum, nftBypass(f.cfg.FailOpen)))
+		script.WriteString("  }\n")
 	}
+	script.WriteString("}\n")
 
 	if err := runWithInput(ctx, "nft", []string{"-f", "-"}, script.String(), false); err != nil {
 		return fmt.Errorf("install nftables rules: %w", err)
@@ -92,6 +98,8 @@ type iptablesFirewall struct {
 }
 
 func (f iptablesFirewall) Install(ctx context.Context) error {
+	ensureNFQueueKernelSupport(ctx)
+
 	if err := f.Cleanup(ctx); err != nil {
 		log.WithError(err).Debug("iptables cleanup before install failed")
 	}
@@ -189,4 +197,13 @@ func runWithInput(ctx context.Context, name string, args []string, stdin string,
 		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return nil
+}
+
+func ensureNFQueueKernelSupport(ctx context.Context) {
+	if _, err := exec.LookPath("modprobe"); err != nil {
+		return
+	}
+	if err := runCommand(ctx, "modprobe", []string{"nfnetlink_queue"}, true); err != nil {
+		log.WithError(err).Debug("modprobe nfnetlink_queue failed")
+	}
 }
