@@ -16,11 +16,13 @@ var bpfProgram []byte
 
 // XDPFilter manages the XDP eBPF program
 type XDPFilter struct {
-	program      *ebpf.Program
-	blockedPorts *ebpf.Map
-	stats        *ebpf.Map
-	xdpLink      link.Link
-	iface        string
+	program        *ebpf.Program
+	blockedPorts   *ebpf.Map
+	blockedDomains *ebpf.Map
+	configMap      *ebpf.Map
+	stats          *ebpf.Map
+	xdpLink        link.Link
+	iface          string
 }
 
 // NewXDPFilter creates and loads the XDP filter
@@ -33,13 +35,31 @@ func NewXDPFilter(iface string) (*XDPFilter, error) {
 
 	// Load into kernel
 	objs := struct {
-		Program      *ebpf.Program `ebpf:"xdp_filter"`
-		BlockedPorts *ebpf.Map     `ebpf:"blocked_ports"`
-		Stats        *ebpf.Map     `ebpf:"stats"`
+		Program        *ebpf.Program `ebpf:"xdp_filter"`
+		BlockedPorts   *ebpf.Map     `ebpf:"blocked_ports"`
+		BlockedDomains *ebpf.Map     `ebpf:"blocked_domains"`
+		ConfigMap      *ebpf.Map     `ebpf:"config_map"`
+		Stats          *ebpf.Map     `ebpf:"stats"`
 	}{}
 
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
 		return nil, fmt.Errorf("failed to load eBPF objects: %w", err)
+	}
+
+	// Initialize config map with default values
+	cfgKey := uint32(0)
+	cfg := struct {
+		DNSMode uint32
+	}{
+		DNSMode: 0, // Default: DROP
+	}
+	if err := objs.ConfigMap.Put(&cfgKey, &cfg); err != nil {
+		objs.Program.Close()
+		objs.BlockedPorts.Close()
+		objs.BlockedDomains.Close()
+		objs.ConfigMap.Close()
+		objs.Stats.Close()
+		return nil, fmt.Errorf("failed to init config: %w", err)
 	}
 
 	// Get interface
@@ -67,11 +87,13 @@ func NewXDPFilter(iface string) (*XDPFilter, error) {
 	log.WithField("interface", iface).Info("XDP program attached")
 
 	return &XDPFilter{
-		program:      objs.Program,
-		blockedPorts: objs.BlockedPorts,
-		stats:        objs.Stats,
-		xdpLink:      xdpLink,
-		iface:        iface,
+		program:        objs.Program,
+		blockedPorts:   objs.BlockedPorts,
+		blockedDomains: objs.BlockedDomains,
+		configMap:      objs.ConfigMap,
+		stats:          objs.Stats,
+		xdpLink:        xdpLink,
+		iface:          iface,
 	}, nil
 }
 
@@ -90,6 +112,47 @@ func (f *XDPFilter) UnblockPort(port uint16) error {
 	if err := f.blockedPorts.Delete(port); err != nil {
 		return fmt.Errorf("failed to unblock port %d: %w", port, err)
 	}
+	return nil
+}
+
+// BlockDomain adds a domain to the blocked list
+func (f *XDPFilter) BlockDomain(domain string) error {
+	key := make([]byte, 128)
+	copy(key, domain)
+	val := uint8(1)
+	if err := f.blockedDomains.Put(key, val); err != nil {
+		return fmt.Errorf("failed to block domain %s: %w", domain, err)
+	}
+	log.WithField("domain", domain).Debug("domain blocked in XDP")
+	return nil
+}
+
+// UnblockDomain removes a domain from the blocked list
+func (f *XDPFilter) UnblockDomain(domain string) error {
+	key := make([]byte, 128)
+	copy(key, domain)
+	if err := f.blockedDomains.Delete(key); err != nil {
+		return fmt.Errorf("failed to unblock domain %s: %w", domain, err)
+	}
+	return nil
+}
+
+// SetDNSMode sets the DNS handling mode (0=DROP, 1=POISON)
+func (f *XDPFilter) SetDNSMode(mode int) error {
+	cfgKey := uint32(0)
+	cfg := struct {
+		DNSMode uint32
+	}{
+		DNSMode: uint32(mode),
+	}
+	if err := f.configMap.Put(&cfgKey, &cfg); err != nil {
+		return fmt.Errorf("failed to set DNS mode: %w", err)
+	}
+	modeStr := "DROP"
+	if mode == 1 {
+		modeStr = "POISON"
+	}
+	log.WithField("mode", modeStr).Debug("DNS mode set")
 	return nil
 }
 
@@ -116,6 +179,22 @@ func (f *XDPFilter) GetStats() (total, blocked, passed uint64, err error) {
 	return total, blocked, passed, nil
 }
 
+// GetDetailedStats returns all statistics including HTTP/TLS/DNS counts
+func (f *XDPFilter) GetDetailedStats() (map[string]uint64, error) {
+	stats := make(map[string]uint64)
+	statNames := []string{"total", "blocked", "passed", "http", "tls", "dns", "dns_poisoned"}
+
+	for i, name := range statNames {
+		key := uint32(i)
+		var val uint64
+		if err := f.stats.Lookup(&key, &val); err == nil {
+			stats[name] = val
+		}
+	}
+
+	return stats, nil
+}
+
 // Close cleans up resources
 func (f *XDPFilter) Close() error {
 	if f.xdpLink != nil {
@@ -126,6 +205,12 @@ func (f *XDPFilter) Close() error {
 	}
 	if f.blockedPorts != nil {
 		f.blockedPorts.Close()
+	}
+	if f.blockedDomains != nil {
+		f.blockedDomains.Close()
+	}
+	if f.configMap != nil {
+		f.configMap.Close()
 	}
 	if f.stats != nil {
 		f.stats.Close()

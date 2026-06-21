@@ -4,6 +4,8 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,6 +16,9 @@ func main() {
 	// CLI flags
 	iface := flag.String("iface", "", "Network interface (required)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
+	ports := flag.String("ports", "80,443,53", "Ports to block (comma-separated)")
+	domains := flag.String("domains", "", "Domains to block (comma-separated)")
+	dnsMode := flag.String("dns-mode", "drop", "DNS mode: drop or poison")
 	flag.Parse()
 
 	// Set log level
@@ -42,21 +47,50 @@ func main() {
 	}
 	defer xdpFilter.Close()
 
-	// Block common ports
-	// HTTP
-	if err := xdpFilter.BlockPort(80); err != nil {
-		log.WithError(err).Warn("failed to block port 80")
+	// Block ports
+	portList := strings.Split(*ports, ",")
+	for _, portStr := range portList {
+		port, err := strconv.Atoi(strings.TrimSpace(portStr))
+		if err != nil || port < 1 || port > 65535 {
+			log.WithError(err).Warnf("invalid port: %s", portStr)
+			continue
+		}
+		if err := xdpFilter.BlockPort(uint16(port)); err != nil {
+			log.WithError(err).Warnf("failed to block port %d", port)
+		}
 	}
-	// HTTPS
-	if err := xdpFilter.BlockPort(443); err != nil {
-		log.WithError(err).Warn("failed to block port 443")
-	}
-	// DNS
-	if err := xdpFilter.BlockPort(53); err != nil {
-		log.WithError(err).Warn("failed to block port 53")
+	log.Infof("Ports %s blocked", *ports)
+
+	// Block domains
+	if *domains != "" {
+		domainList := strings.Split(*domains, ",")
+		for _, domain := range domainList {
+			domain = strings.TrimSpace(domain)
+			if domain == "" {
+				continue
+			}
+			if err := xdpFilter.BlockDomain(domain); err != nil {
+				log.WithError(err).Warnf("failed to block domain %s", domain)
+			}
+		}
+		log.Infof("Domains %s blocked", *domains)
 	}
 
-	log.Info("Ports 80, 443, 53 blocked. Press Ctrl+C to stop.")
+	// Set DNS mode
+	mode := 0 // DROP
+	if *dnsMode == "poison" {
+		mode = 1
+	}
+	if err := xdpFilter.SetDNSMode(mode); err != nil {
+		log.WithError(err).Warn("failed to set DNS mode")
+	}
+	log.Infof("DNS mode: %s", *dnsMode)
+
+	if *domains != "" {
+		log.Info("Traffic filter active (ports + domains). Press Ctrl+C to stop.")
+	} else {
+		log.Info("Traffic filter active (ports only). Press Ctrl+C to stop.")
+	}
 
 	// Print stats periodically
 	ticker := time.NewTicker(5 * time.Second)
