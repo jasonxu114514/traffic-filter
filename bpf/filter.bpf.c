@@ -78,12 +78,18 @@ static __always_inline int is_domain_blocked(char *domain, int len, void *data_e
 
     // Limit length
     if (len > MAX_DOMAIN_LEN - 1) len = MAX_DOMAIN_LEN - 1;
+    if (len <= 0) return 0;
+
+    // Boundary check first
+    if (domain >= (char *)data_end) return 0;
+    if (domain + len > (char *)data_end) {
+        len = (char *)data_end - domain;
+    }
 
     // Copy domain to fixed-size key (limited to 64 bytes to reduce instructions)
     #pragma unroll
     for (int i = 0; i < 64; i++) {
         if (i >= len) break;
-        if (domain + i >= (char *)data_end) break;
         key[i] = domain[i];
     }
 
