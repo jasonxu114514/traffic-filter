@@ -26,6 +26,9 @@ char LICENSE[] SEC("license") = "GPL";
 #define DOMAIN_TLS 2
 #define DOMAIN_DNS_POISON 4
 
+#define DISPATCH_IPV4 0
+#define DISPATCH_IPV6 1
+
 #define STAT_TOTAL 0
 #define STAT_PASSED 1
 #define STAT_HTTP_BLOCKED 2
@@ -116,6 +119,13 @@ struct {
     __type(key, __u32);
     __type(value, __u64);
 } stats SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 2);
+    __type(key, __u32);
+    __type(value, __u32);
+} dispatch_rules SEC(".maps");
 
 static __always_inline void inc_stat(__u32 key)
 {
@@ -877,6 +887,36 @@ static __noinline int handle_ipv6(void *data, void *data_end, struct ethhdr *eth
     return XDP_PASS;
 }
 
+SEC("xdp/ipv4")
+int xdp_ipv4(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        inc_stat(STAT_MALFORMED);
+        return XDP_PASS;
+    }
+
+    return handle_ipv4(data, data_end, eth);
+}
+
+SEC("xdp/ipv6")
+int xdp_ipv6(struct xdp_md *ctx)
+{
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end) {
+        inc_stat(STAT_MALFORMED);
+        return XDP_PASS;
+    }
+
+    return handle_ipv6(data, data_end, eth);
+}
+
 SEC("xdp")
 int xdp_filter(struct xdp_md *ctx)
 {
@@ -891,11 +931,17 @@ int xdp_filter(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    if (eth->h_proto == bpf_htons(ETH_P_IP))
-        return handle_ipv4(data, data_end, eth);
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_IPV4);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
 
-    if (eth->h_proto == bpf_htons(ETH_P_IPV6))
-        return handle_ipv6(data, data_end, eth);
+    if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        bpf_tail_call(ctx, &dispatch_rules, DISPATCH_IPV6);
+        inc_stat(STAT_PASSED);
+        return XDP_PASS;
+    }
 
     inc_stat(STAT_PASSED);
     return XDP_PASS;

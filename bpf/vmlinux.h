@@ -22,6 +22,7 @@ typedef _Bool bool;
 
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_ARRAY 2
+#define BPF_MAP_TYPE_PROG_ARRAY 3
 #define BPF_MAP_TYPE_LPM_TRIE 11
 #define BPF_F_NO_PREALLOC 1
 

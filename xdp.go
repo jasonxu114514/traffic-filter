@@ -69,6 +69,9 @@ type ipPortV6Key struct {
 
 type XDPFilter struct {
 	program       *ebpf.Program
+	ipv4Program   *ebpf.Program
+	ipv6Program   *ebpf.Program
+	dispatchRules *ebpf.Map
 	domainRules   *ebpf.Map
 	cidrRules     *ebpf.Map
 	cidrV6Rules   *ebpf.Map
@@ -91,6 +94,9 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 
 	objs := struct {
 		Program       *ebpf.Program `ebpf:"xdp_filter"`
+		IPv4Program   *ebpf.Program `ebpf:"xdp_ipv4"`
+		IPv6Program   *ebpf.Program `ebpf:"xdp_ipv6"`
+		DispatchRules *ebpf.Map     `ebpf:"dispatch_rules"`
 		DomainRules   *ebpf.Map     `ebpf:"domain_rules"`
 		CidrRules     *ebpf.Map     `ebpf:"cidr_rules"`
 		CidrV6Rules   *ebpf.Map     `ebpf:"cidr_v6_rules"`
@@ -103,15 +109,20 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 		return nil, fmt.Errorf("load eBPF objects: %w", err)
 	}
 
+	if err := populateDispatchRules(objs.DispatchRules, objs.IPv4Program, objs.IPv6Program); err != nil {
+		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		return nil, err
+	}
+
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		closeObjects(objs.Program, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
 		return nil, fmt.Errorf("find interface %s: %w", ifaceName, err)
 	}
 
 	flags, err := xdpAttachFlags(mode)
 	if err != nil {
-		closeObjects(objs.Program, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
 		return nil, err
 	}
 
@@ -121,7 +132,7 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 		Flags:     flags,
 	})
 	if err != nil {
-		closeObjects(objs.Program, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
+		closeObjects(objs.Program, objs.IPv4Program, objs.IPv6Program, objs.DispatchRules, objs.DomainRules, objs.CidrRules, objs.CidrV6Rules, objs.IPPortRules, objs.IPPortV6Rules, objs.Stats)
 		return nil, fmt.Errorf("attach XDP to %s: %w", ifaceName, err)
 	}
 
@@ -132,6 +143,9 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 
 	return &XDPFilter{
 		program:       objs.Program,
+		ipv4Program:   objs.IPv4Program,
+		ipv6Program:   objs.IPv6Program,
+		dispatchRules: objs.DispatchRules,
 		domainRules:   objs.DomainRules,
 		cidrRules:     objs.CidrRules,
 		cidrV6Rules:   objs.CidrV6Rules,
@@ -141,6 +155,27 @@ func NewXDPFilter(ifaceName, mode string) (*XDPFilter, error) {
 		xdpLink:       xdpLink,
 		iface:         ifaceName,
 	}, nil
+}
+
+func populateDispatchRules(dispatch *ebpf.Map, ipv4, ipv6 *ebpf.Program) error {
+	if dispatch == nil {
+		return errors.New("dispatch_rules map is missing")
+	}
+	if ipv4 == nil || ipv6 == nil {
+		return errors.New("dispatch programs are missing")
+	}
+
+	ipv4Key := uint32(0)
+	if err := dispatch.Put(&ipv4Key, ipv4); err != nil {
+		return fmt.Errorf("put IPv4 dispatch program: %w", err)
+	}
+
+	ipv6Key := uint32(1)
+	if err := dispatch.Put(&ipv6Key, ipv6); err != nil {
+		return fmt.Errorf("put IPv6 dispatch program: %w", err)
+	}
+
+	return nil
 }
 
 func xdpAttachFlags(mode string) (link.XDPAttachFlags, error) {
@@ -287,7 +322,7 @@ func (f *XDPFilter) Close() error {
 	if f.xdpLink != nil {
 		_ = f.xdpLink.Close()
 	}
-	closeObjects(f.program, f.domainRules, f.cidrRules, f.cidrV6Rules, f.ipPortRules, f.ipPortV6Rules, f.stats)
+	closeObjects(f.program, f.ipv4Program, f.ipv6Program, f.dispatchRules, f.domainRules, f.cidrRules, f.cidrV6Rules, f.ipPortRules, f.ipPortV6Rules, f.stats)
 	log.WithField("interface", f.iface).Info("XDP program detached")
 	return nil
 }
