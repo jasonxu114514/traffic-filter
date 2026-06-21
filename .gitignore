@@ -1,0 +1,30 @@
+# Binary (root only)
+/traffic-filter
+
+# Generated eBPF bindings
+pkg/filter/bpf_bpfel.go
+pkg/filter/bpf_bpfel.o
+pkg/filter/bpf_bpfeb.go
+pkg/filter/bpf_bpfeb.o
+
+# Compiled eBPF
+bpf/traffic_filter.o
+*.o
+
+# Go
+go.sum
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Coverage
+coverage.txt
+coverage.html
