@@ -110,15 +110,15 @@ func (f *filterEngine) evaluate(buf []byte, n int, ifIdx int) verdict {
 		if f.ips[dstKey] || f.ips[srcKey] {
 			return verdict{action: "rst", tcpOff: transportOff, ifIdx: ifIdx}
 		}
-		// 3) HTTP / TLS domain check
+		// 3) HTTP / TLS domain check → send RST
 		if dport == 80 {
 			if f.checkHTTP(buf, payloadOff, n) {
-				return verdict{action: "drop"}
+				return verdict{action: "rst", tcpOff: transportOff, ifIdx: ifIdx}
 			}
 		}
 		if dport == 443 {
 			if f.checkTLS(buf, payloadOff, n) {
-				return verdict{action: "drop"}
+				return verdict{action: "rst", tcpOff: transportOff, ifIdx: ifIdx}
 			}
 		}
 
