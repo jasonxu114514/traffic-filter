@@ -300,8 +300,7 @@ static __always_inline int check_tls_sni(void *data, void *data_end, __u32 off) 
     pos += 1 + (__u8)p[pos];  // compression
 
     if (p + pos + 2 > (char *)data_end) return XDP_PASS;
-    __u16 elen = (p[pos]<<8) | p[pos+1];
-    pos += 2;
+    pos += 2;  // skip extensions length field
 
 #pragma unroll
     for (int i = 0; i < 20; i++) {
@@ -332,10 +331,6 @@ static __always_inline int check_tls_sni(void *data, void *data_end, __u32 off) 
 static __always_inline int send_tcp_rst(struct xdp_md *ctx,
     struct ethhdr *eth, struct iphdr *ip, struct tcphdr *tcp) {
 
-    __u32 tcp_off = tcp->doff * 4;
-    __u32 ip_len  = bpf_ntohs(ip->tot_len);
-    __u32 tcp_len = ip_len - (ip->ihl * 4);
-
     // Swap MAC
     __u8 tmp[6];
     mem_cpy(tmp, eth->h_source, 6);
@@ -352,7 +347,6 @@ static __always_inline int send_tcp_rst(struct xdp_md *ctx,
     __u16 orig_src  = tcp->source;
     __u16 orig_dst  = tcp->dest;
     __u32 orig_seq  = bpf_ntohl(tcp->seq);
-    __u32 orig_ack  = bpf_ntohl(tcp->ack_seq);
 
     tcp->source = orig_dst;
     tcp->dest   = orig_src;
@@ -391,13 +385,6 @@ static __always_inline int send_tcp_rst(struct xdp_md *ctx,
     // Fixup: add pseudo-header to the folded result
     csum += (__u16)~(tcp->check);
     tcp->check = fold_csum(csum);
-
-    // If no payload, set checksum directly
-    if (tcp->doff == 5) {
-        __u32 sum = tcp_pseudo_csum(ip->saddr, ip->daddr, (__u16)(new_ip_len - (ip->ihl * 4)));
-        tcp->check = ip_csum(tcp, tcp->doff * 2);
-        // Simplified: use 0 (many NICs offload TCP checksum anyway)
-    }
 
     increment_stat(STAT_RST_SENT);
     return XDP_TX;
